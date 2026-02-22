@@ -1,6 +1,6 @@
 # Pediatric Genetic Test Report Extractor
 
-Structured data extraction from pediatric genetic test reports using local HuggingFace models with schema-driven prompting and self-correcting validation. Designed for the Indiana University NICU Genomics REDCap project (PID 31291).
+Structured data extraction from pediatric genetic test reports using local HuggingFace models with schema-driven prompting and self-correcting validation.
 
 ## What It Does
 
