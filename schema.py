@@ -4,10 +4,10 @@ SINGLE SOURCE OF TRUTH — edit this file to change what gets extracted.
 main.py imports `get_extraction_model()` and `build_format_instructions()`
 and never hardcodes field names.
 
-TARGET: Genetic test report PDFs (e.g., from GeneDx, Invitae, IU NGS, etc.)
-for NICU/pediatric patients. Extracts only what is present on the report itself.
+TARGET: Genetic test report PDFs and text for NICU/pediatric patients.
+Extracts only what is present on the report itself.
 
-REDCap mapping notes (Indiana University, PID 31291):
+REDCap mapping notes:
   - PatientDemographics  → demographics_birth_history_and_admission (subset)
   - TestInformation      → genetic_tests: test-level fields
   - GeneticFinding       → genetic_tests: finding1..finding20 (as List)
