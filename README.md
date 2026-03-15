@@ -1,259 +1,382 @@
-# Pediatric Genetic Test Report Extractor
+# MedACE Pediatric Genetic Test Report Extractor
 
-Structured data extraction from pediatric genetic test reports using local HuggingFace models with schema-driven prompting and self-correcting validation.
+Schema-driven structured extraction for pediatric/NICU genetic test reports.
 
-## What It Does
+The pipeline now supports **two completely separate inference backends**:
 
-Given a genetic test report (PDF or plain text), this tool:
+- **Local HuggingFace inference** for direct model loading inside the Python process
+- **External vLLM endpoint inference** for OpenAI-compatible servers such as the apptainer-backed `gpt-oss-20b` / `gpt-oss-120b` jobs you launch on IU HPC
 
-1. Parses the report (auto-detects PDF vs text)
-2. Generates a prompt from the Pydantic schema (so you never write prompts by hand)
-3. Sends it to a locally-loaded LLM on your GPUs
-4. Validates the output against the schema with Pydantic
-5. If validation fails, feeds the errors back to the LLM and re-asks (up to N retries)
-6. Writes a clean JSON file
+The schema in `schema.py` remains the **single source of truth**.
 
-The key idea: **`schema.py` is the single source of truth.** You define what to extract there — field names, types, constraints, enums — and the pipeline auto-generates the LLM prompt, validates the output, and handles retries. No prompt editing needed.
+---
 
-## Project Structure
+## What it does
 
+Given a genetic testing report (`.pdf` or `.txt`), the extractor:
+
+1. Reads the report text
+2. Builds extraction instructions directly from the Pydantic schema
+3. Sends the prompt to either a local HF model or a vLLM endpoint
+4. Parses the JSON response
+5. Validates it against the schema with Pydantic
+6. Re-asks with validation errors if needed
+7. Writes a clean JSON file
+
+---
+
+## Files
+
+```text
+medace.py   # primary CLI; backend-switchable HF <-> vLLM
+main.py     # backward-compatible wrapper that calls medace.py
+schema.py   # extraction schema; edit here to add/remove fields
+README.md   # usage notes
 ```
-├── main.py       # CLI entry point: load model, run extraction, write JSON
-├── schema.py     # Pydantic schema: defines all fields, types, validators
-└── README.md
+
+---
+
+## Schema coverage
+
+The expanded schema is aligned to the highlighted REDCap variables and keeps repeatable blocks as lists instead of hardcoded suffix fields.
+
+Top-level groups:
+
+- `patient`
+- `nicu_flags`
+- `test_info`
+- `patient_phenotypes`
+- `findings`
+- `interpretation`
+- `diagnoses`
+
+### Important modeling choice
+
+REDCap repeats fields like `finding1 ... finding20` and diagnosis blocks like `dxname`, `dxname_2`, `dxname_3`.
+
+In this extractor those become:
+
+- `findings: List[GeneticFinding]`
+- `diagnoses: List[GeneticDiagnosis]`
+
+That keeps the schema much cleaner while still mapping cleanly back to REDCap later.
+
+---
+
+## Supported backends
+
+### 1) Local HuggingFace backend
+
+Good for smaller models or quick local testing.
+
+Supported aliases:
+
+| Alias | Resolved model ID |
+|---|---|
+| `oss-120b` | `openai/gpt-oss-120b` |
+| `oss-20b` | `openai/gpt-oss-20b` |
+| `llama3.1-8b` | `meta-llama/Llama-3.1-8B-Instruct` |
+
+You can also pass any full model ID directly.
+
+### 2) vLLM endpoint backend
+
+Good for IU HPC jobs where the model server is started separately via sbatch/apptainer.
+
+The CLI expects an **OpenAI-compatible** endpoint, such as:
+
+- `http://127.0.0.1:8020`
+- `http://127.0.0.1:8020/v1`
+
+Both are accepted.
+
+---
+
+## Installation
+
+### Minimal install for endpoint mode only
+
+If you only use a remote/local vLLM endpoint, you do **not** need `torch` or `transformers` in this environment.
+
+```bash
+pip install pydantic
+pip install pymupdf   # recommended for PDFs
+# or
+pip install pdfplumber
 ```
 
-## Setup
-
-### Requirements
-
-- Python 3.10+
-- CUDA-capable GPU(s) with sufficient VRAM
-- HuggingFace model access (may require `huggingface-cli login` for gated models)
-
-### Install Dependencies
+### Install for local HF mode
 
 ```bash
 pip install torch transformers accelerate pydantic
-
-# for PDF support (install at least one):
-pip install pymupdf       # recommended, fast C backend
+pip install pymupdf   # recommended
 # or
-pip install pdfplumber    # pure-python alternative
+pip install pdfplumber
 ```
 
-## Supported Models
+---
 
-| Alias | HuggingFace Model ID | Notes |
-|---|---|---|
-| `oss-120b` | `openai/gpt-oss-120b` | MoE, strongest extraction quality |
-| `oss-20b` | `openai/gpt-oss-20b` | MoE, good balance of speed and quality |
-| `llama3.1-8b` | `meta-llama/Llama-3.1-8B-Instruct` | Dense, fastest inference |
+## Quick start
 
-You can also pass any full HuggingFace model ID directly (e.g., `-m mistralai/Mistral-7B-Instruct-v0.3`).
-
-## Quick Start
-
-### Basic usage (plain text report)
+### Local HF inference
 
 ```bash
-python main.py -i report.txt -m oss-120b --num-gpus 4
+python medace.py \
+  -i report.pdf \
+  --backend hf \
+  -m oss-20b \
+  --num-gpus 2
 ```
 
-### PDF report
+### vLLM endpoint inference
 
 ```bash
-python main.py -i report.pdf -m oss-20b --num-gpus 2
+python medace.py \
+  -i report.pdf \
+  --backend vllm \
+  --base-url http://127.0.0.1:8020 \
+  -m openai/gpt-oss-120b
 ```
 
-### Specify output path
+### Auto backend selection
+
+If `--base-url` is supplied, `--backend auto` selects the endpoint backend automatically.
 
 ```bash
-python main.py -i report.pdf -m llama3.1-8b -o results/patient_001.json
+python medace.py \
+  -i report.pdf \
+  --base-url http://127.0.0.1:8020 \
+  -m openai/gpt-oss-20b
 ```
 
-### All options
+### Backward compatibility
+
+`main.py` still works and now simply delegates to `medace.py`:
 
 ```bash
-python main.py \
-  -i report.pdf \              # input file (required)
-  -m oss-120b \                # model alias or full HF ID (required)
-  --num-gpus 4 \               # number of GPUs (default: 1)
-  --dtype bfloat16 \           # model dtype: auto, bfloat16, float16 (default: auto)
-  --input-format pdf \         # force input format: text or pdf (default: auto-detect)
-  --temperature 0.3 \          # sampling temperature (default: 0.3)
-  --top-p 0.9 \                # nucleus sampling top-p (default: 0.9)
-  --max-new-tokens 32768 \     # max tokens to generate (default: 32768)
-  --max-retries 3 \            # validation retry attempts (default: 3)
-  --verbose \                  # debug logging
-  -o output.json               # output path (default: <input>.extracted.json)
+python main.py -i report.pdf --base-url http://127.0.0.1:8020 -m openai/gpt-oss-20b
 ```
 
-## Output Format
+---
 
-The output is a JSON file matching the schema defined in `schema.py`. Example:
+## CLI reference
+
+```bash
+python medace.py \
+  -i report.pdf \
+  -o output.json \
+  -m oss-20b \
+  --backend auto \
+  --base-url http://127.0.0.1:8020 \
+  --api-key EMPTY \
+  --read-timeout 1800 \
+  --num-gpus 2 \
+  --dtype bfloat16 \
+  --input-format pdf \
+  --temperature 0.0 \
+  --top-p 1.0 \
+  --max-new-tokens 32768 \
+  --max-retries 3 \
+  --verbose
+```
+
+### Key arguments
+
+- `--backend {auto,hf,vllm}`: choose inference backend
+- `--base-url`: OpenAI-compatible vLLM endpoint base URL
+- `--read-timeout`: useful for long endpoint generations on HPC
+- `--num-gpus`: HF backend only; budgets across visible GPUs
+- `--print-prompt`: prints the schema-derived prompt and exits
+
+---
+
+## IU HPC / vLLM workflow
+
+Your sbatch launcher starts the server first, then this CLI should point at that server.
+
+Typical pattern:
+
+1. Start `gpt-oss-20b` or `gpt-oss-120b` with the sbatch/apptainer server job
+2. Wait until the endpoint responds at `/v1/models`
+3. Run:
+
+```bash
+python medace.py \
+  -i /path/to/report.pdf \
+  --backend vllm \
+  --base-url http://127.0.0.1:8020 \
+  -m openai/gpt-oss-120b
+```
+
+The served model name must match what the vLLM server exposes.
+
+---
+
+## Output format
+
+The output is a JSON object conforming to `schema.py`.
+
+Example skeleton:
 
 ```json
 {
   "patient": {
-    "patient_name_last": "Smith",
-    "patient_name_first": "Jane",
-    "date_of_birth": "2024-01-15",
-    "mrn": "12345678",
-    "sex": "Female",
+    "patient_name_last": null,
+    "patient_name_first": null,
+    "date_of_birth": null,
+    "mrn": null,
+    "sex": null,
+    "field_confidence": null
+  },
+  "nicu_flags": {
+    "nicu_genetic_testing": true,
+    "nicu_genetic_diagnosis": false,
     "field_confidence": {
-      "patient_name_last": {"confidence": "high", "interval": "0.95-0.99"},
-      "patient_name_first": {"confidence": "high", "interval": "0.95-0.99"},
-      "date_of_birth": {"confidence": "high", "interval": "0.95-0.99"},
-      "mrn": {"confidence": "high", "interval": "0.90-0.99"},
-      "sex": {"confidence": "high", "interval": "0.95-0.99"}
+      "nicu_genetic_testing": {
+        "confidence": "high",
+        "interval": "0.95-0.99"
+      }
     }
   },
   "test_info": {
     "test_type": "Genome Sequencing",
-    "test_type_other": null,
-    "test_name": "Rapid Trio Genome Sequencing",
-    "reanalysis": false,
-    "lab": "GeneDx",
-    "lab_other": null,
-    "order_date": "2024-03-01",
-    "result_date": "2024-03-20",
-    "analysis_type": "Trio",
-    "secondary_findings": "Opt-IN",
+    "test_name": "Rapid Genome Sequencing",
+    "result_available": true,
+    "test_declined": false,
+    "lab": "IU Diagnostic Genomics",
+    "order_date": "2024-08-22",
+    "result_date": "2024-08-29",
+    "timeframe": "NICU Stay",
+    "analysis_type": "Proband Only",
+    "secondary_findings": "Opt-OUT",
     "findings_reported": true,
     "field_confidence": {
-      "test_type": {"confidence": "high", "interval": "0.95-0.99"},
-      "lab": {"confidence": "high", "interval": "0.95-0.99"},
-      "result_date": {"confidence": "high", "interval": "0.95-0.99"}
-    }
-  },
-  "findings": [
-    {
-      "gene_locus": "SCN1A",
-      "variant": "c.1234A>G",
-      "protein": "p.Thr412Ala",
-      "transcript": "NM_001165963.4",
-      "dosage": null,
-      "roh": false,
-      "classification": "Pathogenic",
-      "zygosity": "Heterozygous",
-      "inheritance": "Autosomal Dominant",
-      "segregation": "De Novo",
-      "finding_class": "Primary",
-      "additional_info": null,
-      "field_confidence": {
-        "gene_locus": {"confidence": "high", "interval": "0.95-0.99"},
-        "variant": {"confidence": "high", "interval": "0.95-0.99"},
-        "classification": {"confidence": "high", "interval": "0.95-0.99"},
-        "segregation": {"confidence": "moderate", "interval": "0.75-0.90", "comment": "Stated as de novo based on trio analysis"}
+      "test_type": {
+        "confidence": "high",
+        "interval": "0.95-0.99"
       }
     }
-  ],
-  "interpretation": {
-    "result": "Diagnostic",
-    "reference_genome": "GRCh38/hg38",
-    "interpretation_summary": "A pathogenic variant in SCN1A was identified, consistent with Dravet syndrome.",
-    "field_confidence": {
-      "result": {"confidence": "high", "interval": "0.95-0.99"},
-      "reference_genome": {"confidence": "high", "interval": "0.90-0.99"}
-    }
   },
+  "patient_phenotypes": {
+    "phenotype_test_date": "2024-08-22",
+    "clinical_indication_text": null,
+    "hpo_terms": [],
+    "field_confidence": null
+  },
+  "findings": [],
+  "interpretation": {
+    "result": "Nondiagnostic",
+    "reference_genome": "GRCh38/hg38",
+    "interpretation_summary": null,
+    "field_confidence": null
+  },
+  "diagnoses": [],
   "extraction_confidence": "high",
   "extraction_notes": null
 }
 ```
 
-Fields the LLM cannot determine from the report will be `null`.
+---
 
-## Customizing the Schema
+## Key schema decisions
 
-All extraction fields live in `schema.py`. The pipeline reads the schema at runtime, so changes take effect immediately — no prompt editing required.
+### Repeatable findings and diagnoses
 
-### Adding a new field
+Instead of creating dozens of hardcoded fields like:
 
-Add it to the relevant sub-model with a `Field(description=...)`:
+- `genelocus`
+- `genelocus_2`
+- `genelocus_3`
+- ...
+
+the extractor now uses structured lists.
+
+That means:
+
+- easier prompting
+- easier validation
+- easier comparison logic later
+- much less schema churn when the project evolves
+
+### Diagnosis logic
+
+The schema is designed so that:
+
+- VUS-only findings can still appear in `findings`
+- but they do **not** automatically become entries in `diagnoses`
+- carrier status and ROH stay in `findings`, not `diagnoses`
+
+### Phenotype handling
+
+`patient_phenotypes` is kept separate so you can preserve the report-native phenotype text now and decide later whether to crosswalk those terms to HPO/ICD workflows.
+
+---
+
+## Debugging
+
+### Print the prompt without running a model
+
+```bash
+python medace.py -i report.pdf -m oss-20b --print-prompt
+```
+
+### If JSON parsing fails repeatedly
+
+The pipeline automatically re-asks with the parse error. If that still fails:
+
+- lower `temperature`
+- reduce `max_new_tokens`
+- inspect the prompt with `--print-prompt`
+- try the endpoint backend with a stronger model
+
+### If validation fails repeatedly
+
+That usually means one of two things:
+
+- the schema is too strict for the report family
+- the field description needs to be more explicit
+
+Edit `schema.py`, not the prompt text.
+
+---
+
+## Extending the schema
+
+Everything important lives in `schema.py`.
+
+### Add a new scalar field
 
 ```python
-class PatientDemographics(BaseModel):
-    # ... existing fields ...
-    study_id: Optional[str] = Field(None,
-        description="Study ID if printed on the report")
+class TestInformation(ConfidenceTrackedModel):
+    accession_number: Optional[str] = Field(
+        None,
+        description="Accession number as printed on the report"
+    )
 ```
 
-The `description` string is what the LLM sees in its instructions. Make it specific.
-
-### Supported field types
-
-`schema.py` includes all field types used by the REDCap codebook. Here's a summary:
-
-| Type | Example | Validation |
-|---|---|---|
-| **String** | `Field(None, description="...")` | Optional min/max length, regex pattern |
-| **Integer** | `Field(None, ge=0, le=120, ...)` | Range via `ge`/`le` |
-| **Float** | `Field(None, ge=0.0, le=100.0, ...)` | Range via `ge`/`le` |
-| **Boolean** | `Field(None, description="...")` | True/False |
-| **Enum** | `Field(None, description="...")` | Restricted to enum values |
-| **Date string** | `Field(None, description="...YYYY-MM-DD...")` | `@field_validator` |
-| **Time string** | `Field(None, description="...HH:MM...")` | `@field_validator` |
-| **Dict** | `Optional[Dict[str, str]]` | Key-value pairs |
-| **List** | `Optional[List[str]]` | List of items |
-| **Cross-field** | `@model_validator(mode="after")` | Compare multiple fields |
-
-### Adding a new enum
-
-Define it, then use it as a field type:
+### Add a new repeated block
 
 ```python
-class TestTimeframe(str, Enum):
-    nicu_stay = "NICU Stay"
-    pre_nicu = "Pre-NICU Admission/OSH"
-    prenatal = "Prenatal"
-    post_nicu = "Post-NICU Discharge"
+class AdditionalSample(ConfidenceTrackedModel):
+    sample_type: Optional[str] = Field(None, description="Additional sample type")
 
-class TestInformation(BaseModel):
-    timeframe: Optional[TestTimeframe] = Field(None,
-        description="When the test was ordered relative to NICU stay")
+class GeneticTestExtraction(StrictModel):
+    additional_samples: Optional[List[AdditionalSample]] = Field(
+        None,
+        description="Additional samples linked to the report"
+    )
 ```
 
-The format instructions will automatically list the allowed values.
+No prompt rewrite is needed.
 
-### Adding a new sub-model
+---
 
-Define a new `BaseModel` subclass, then add it as a field on `GeneticTestExtraction`:
+## Recommendation for this project
 
-```python
-class GeneticDiagnosis(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    diagnosis_name: Optional[str] = Field(None, description="Name of genetic diagnosis")
-    associated_gene: Optional[str] = Field(None, description="Associated gene or locus")
+For IU HPC production runs with `gpt-oss-20b` / `gpt-oss-120b`, prefer:
 
-class GeneticTestExtraction(BaseModel):
-    # ... existing fields ...
-    diagnosis: GeneticDiagnosis = Field(
-        default_factory=GeneticDiagnosis, description="Genetic diagnosis if stated on report")
-```
+- `--backend vllm`
+- `--base-url http://127.0.0.1:<PORT>`
+- `--temperature 0.0`
 
-## How the Re-Ask Loop Works
-
-```
-report → [build prompt from schema] → LLM → [parse JSON] → [Pydantic validate]
-                                        ↑                           |
-                                        |     validation error      |
-                                        +←——— [feed errors back] ←——+
-```
-
-If the LLM output fails JSON parsing or Pydantic validation, the errors are appended as a follow-up user message so the model can self-correct. This runs up to `--max-retries` times (default: 3). The Pydantic error messages are specific enough (e.g., "age must be >= 0 and <= 120, got 200") that the model usually fixes them in one retry.
-
-## Troubleshooting
-
-**Out of memory**: Lower `--num-gpus` or use a smaller model. The `oss-*` models are MoE architectures and are more memory-efficient than their parameter count suggests.
-
-**Model download fails**: Run `huggingface-cli login` and ensure you have access to the model. Some models (e.g., Llama) require accepting a license on the HF model page.
-
-**PDF extraction is empty**: Try installing `pdfplumber` as a fallback (`pip install pdfplumber`). Some scanned PDFs may need OCR preprocessing — this tool handles text-based PDFs only.
-
-**Validation keeps failing**: Check `--verbose` output. If the model consistently fails on a field, consider relaxing the constraint in `schema.py` or providing a more specific `description`.
-
-## License
-
-MIT
+For local debugging on a single machine, HF mode is still available.
