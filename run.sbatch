@@ -4,8 +4,8 @@
 #SBATCH --partition=gpu-interactive
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
 #SBATCH --time=02:00:00
 #SBATCH --gres=gpu:h100:1
 #SBATCH --output=logs/%x_%j.log
@@ -16,7 +16,7 @@ set -euo pipefail
 # -------------------------------
 # User-tunable settings
 # -------------------------------
-CODE_DIR="${CODE_DIR:-/N/project/_A-Aa-a0-9/hw56}"
+CODE_DIR="${CODE_DIR:-/N/project/_A-Aa-a0-9/hw56/medace_generic_report}"
 INPUT_DIR="${INPUT_DIR:-/N/project/_A-Aa-a0-9/note/report}"
 MODEL="${MODEL:-openai/gpt-oss-120b}"
 LIMIT="${LIMIT:-5}"               # 0 = all files; default 5 for a quick smoke test
@@ -28,8 +28,8 @@ MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-1024}"
 READ_TIMEOUT="${READ_TIMEOUT:-1800}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-12000}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
-IMG_FILE="${IMG_FILE:-$HOME/containers/vllm-openai-deploy.sif}"
-HF_HOME="${HF_HOME:-$CODE_DIR/.cache/huggingface}"
+IMG_FILE="${IMG_FILE:-/N/project/_A-Aa-a0-9/hw56/medace_generic_report/containers/vllm-openai-deploy.sif}"
+HF_HOME="${HF_HOME:-/N/project/textattn/hf_cache}"
 API="http://127.0.0.1:${PORT}"
 RUN_DIR="${RUN_DIR:-$CODE_DIR/outputs/quartz_${SLURM_JOB_ID}}"
 JSON_DIR="$RUN_DIR/json"
@@ -45,27 +45,23 @@ export HF_HOME
 export HF_HUB_DISABLE_TELEMETRY=1
 export TOKENIZERS_PARALLELISM=false
 
-# -------------------------------
-# Module helpers
-# -------------------------------
-load_first_module() {
-  local modules_txt pattern mod
-  modules_txt="$(module -t avail 2>&1 || true)"
-  for pattern in "$@"; do
-    mod="$(printf '%s\n' "$modules_txt" | awk -v pat="$pattern" '$0 ~ pat {print $1; exit}')"
-    if [[ -n "$mod" ]]; then
-      module load "$mod"
-      echo "[module] loaded $mod"
-      return 0
-    fi
-  done
-  return 1
-}
+# pick up HF token from file if present
+if [[ -z "${HF_TOKEN:-}" && -f "$HF_HOME/token" ]]; then
+  export HF_TOKEN="$(<"$HF_HOME/token")"
+fi
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+else
+  echo "[warn] HF token not found in environment or $HF_HOME/token"
+  echo "[warn] model download may fail if the repo requires authentication"
+fi
 
+# -------------------------------
+# Explicit Quartz modules
+# -------------------------------
 module purge || true
-load_first_module '^python/3\\.12' '^Python/3\\.12' '^python/' '^Python/' || true
-load_first_module '^apptainer' '^Apptainer' '^singularity' '^Singularity' || true
-load_first_module '^cuda/' '^CUDA/' || true
+module load python/3.12.4
+module load apptainer/1.3.6
 
 # -------------------------------
 # Activate venv
@@ -77,8 +73,9 @@ fi
 source "$CODE_DIR/.venv/bin/activate"
 
 command -v python >/dev/null || { echo "[fatal] python not found after venv activation"; exit 3; }
-command -v apptainer >/dev/null || { echo "[fatal] apptainer not found; load the Apptainer module first"; exit 4; }
+command -v apptainer >/dev/null || { echo "[fatal] apptainer not found after module load"; exit 4; }
 command -v curl >/dev/null || { echo "[fatal] curl not found"; exit 5; }
+[[ -f "$CODE_DIR/main.py" ]] || { echo "[fatal] missing $CODE_DIR/main.py"; exit 6; }
 
 python --version
 which python
@@ -89,7 +86,7 @@ if [[ ! -f "$IMG_FILE" ]]; then
   echo "[fatal] Apptainer image not found: $IMG_FILE"
   echo "        Build it once on the login node with:"
   echo "        apptainer pull $IMG_FILE docker://vllm/vllm-openai:deploy"
-  exit 6
+  exit 7
 fi
 
 # -------------------------------
@@ -97,11 +94,12 @@ fi
 # -------------------------------
 echo "[info] starting vLLM server"
 
-aapptainer_cmd=(
+apptainer_cmd=(
   apptainer exec --nv
   --bind "$HF_HOME":/root/.cache/huggingface
   "$IMG_FILE" bash -lc
   "set -euo pipefail; \
+   export HF_HOME=/root/.cache/huggingface; \
    vllm serve '$MODEL' \
      --served-model-name '$MODEL' \
      --host 0.0.0.0 \
@@ -116,7 +114,7 @@ aapptainer_cmd=(
      --enforce-eager"
 )
 
-"${aapptainer_cmd[@]}" >"$LOG_DIR/vllm_${SLURM_JOB_ID}.log" 2>"$LOG_DIR/vllm_${SLURM_JOB_ID}.err" &
+"${apptainer_cmd[@]}" >"$LOG_DIR/vllm_${SLURM_JOB_ID}.log" 2>"$LOG_DIR/vllm_${SLURM_JOB_ID}.err" &
 SERVER_PID=$!
 
 cleanup() {
@@ -129,12 +127,12 @@ trap cleanup EXIT
 # Wait for readiness
 for ((i=1; i<=300; i++)); do
   if curl -fsS "$API/v1/models" >/dev/null 2>&1; then
-    echo "[info] vLLM ready after ${i}s at $API"
+    echo "[info] vLLM ready at $API"
     break
   fi
   if (( i == 300 )); then
     echo "[fatal] vLLM did not become ready in time"
-    exit 7
+    exit 8
   fi
   sleep 2
 done
@@ -152,7 +150,7 @@ mapfile -t REPORTS < <(find "$INPUT_DIR" -maxdepth 1 -type f \( -name 'GENETIC_R
 
 if [[ ${#REPORTS[@]} -eq 0 ]]; then
   echo "[fatal] no report .txt files found under $INPUT_DIR"
-  exit 8
+  exit 9
 fi
 
 if [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT > 0 )) && (( ${#REPORTS[@]} > LIMIT )); then
