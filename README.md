@@ -1,382 +1,237 @@
-# MedACE Pediatric Genetic Test Report Extractor
+# Pediatric Genetic Report Extractor + REDCap Compatibility
 
-Schema-driven structured extraction for pediatric/NICU genetic test reports.
+Structured extraction for pediatric/NICU genetic testing reports with a schema-driven prompt, Pydantic validation, and optional OpenAI-compatible vLLM endpoint support.
 
-The pipeline now supports **two completely separate inference backends**:
+The project now supports **two representations at once**:
 
-- **Local HuggingFace inference** for direct model loading inside the Python process
-- **External vLLM endpoint inference** for OpenAI-compatible servers such as the apptainer-backed `gpt-oss-20b` / `gpt-oss-120b` jobs you launch on IU HPC
+1. A **linked, normalized report object** that keeps a test report together with its findings, phenotype note(s), diagnosis note, and diagnoses.
+2. A **legacy REDCap-compatible flat layout** that can import from and export back to the current raw repeating-instrument structure.
 
-The schema in `schema.py` remains the **single source of truth**.
+`main.py` is the canonical CLI. `medace.py` is only a tiny backward-compatible shim.
 
----
+## Why this structure
 
-## What it does
+The current REDCap export stores these at the same logical level but in separate repeating instruments:
 
-Given a genetic testing report (`.pdf` or `.txt`), the extractor:
+- `genetic_tests` → one row per test, with up to 20 finding slots inside the row
+- `patient_phenotypes` → one row per phenotype/HPO note block
+- `genetic_diagnoses` → one row per diagnosis-note block, with up to 3 diagnoses inside the row
 
-1. Reads the report text
-2. Builds extraction instructions directly from the Pydantic schema
-3. Sends the prompt to either a local HF model or a vLLM endpoint
-4. Parses the JSON response
-5. Validates it against the schema with Pydantic
-6. Re-asks with validation errors if needed
-7. Writes a clean JSON file
+That flat layout is fine for REDCap, but it loses the **report ↔ phenotype ↔ diagnosis-note ↔ diagnosis** association.
 
----
+The normalized JSON keeps that association. The flat exporter degrades back to the current REDCap structure when needed.
 
-## Files
+## Supported inference backends
 
-```text
-medace.py   # primary CLI; backend-switchable HF <-> vLLM
-main.py     # backward-compatible wrapper that calls medace.py
-schema.py   # extraction schema; edit here to add/remove fields
-README.md   # usage notes
-```
+- **Local HuggingFace** loading (`torch` + `transformers`)
+- **External vLLM endpoint** exposing an OpenAI-compatible `/v1/chat/completions` API
 
----
+Known model aliases:
 
-## Schema coverage
+- `oss-120b` → `openai/gpt-oss-120b`
+- `oss-20b` → `openai/gpt-oss-20b`
+- `llama3.1-8b` → `meta-llama/Llama-3.1-8B-Instruct`
 
-The expanded schema is aligned to the highlighted REDCap variables and keeps repeatable blocks as lists instead of hardcoded suffix fields.
-
-Top-level groups:
-
-- `patient`
-- `nicu_flags`
-- `test_info`
-- `patient_phenotypes`
-- `findings`
-- `interpretation`
-- `diagnoses`
-
-### Important modeling choice
-
-REDCap repeats fields like `finding1 ... finding20` and diagnosis blocks like `dxname`, `dxname_2`, `dxname_3`.
-
-In this extractor those become:
-
-- `findings: List[GeneticFinding]`
-- `diagnoses: List[GeneticDiagnosis]`
-
-That keeps the schema much cleaner while still mapping cleanly back to REDCap later.
-
----
-
-## Supported backends
-
-### 1) Local HuggingFace backend
-
-Good for smaller models or quick local testing.
-
-Supported aliases:
-
-| Alias | Resolved model ID |
-|---|---|
-| `oss-120b` | `openai/gpt-oss-120b` |
-| `oss-20b` | `openai/gpt-oss-20b` |
-| `llama3.1-8b` | `meta-llama/Llama-3.1-8B-Instruct` |
-
-You can also pass any full model ID directly.
-
-### 2) vLLM endpoint backend
-
-Good for IU HPC jobs where the model server is started separately via sbatch/apptainer.
-
-The CLI expects an **OpenAI-compatible** endpoint, such as:
-
-- `http://127.0.0.1:8020`
-- `http://127.0.0.1:8020/v1`
-
-Both are accepted.
-
----
-
-## Installation
-
-### Minimal install for endpoint mode only
-
-If you only use a remote/local vLLM endpoint, you do **not** need `torch` or `transformers` in this environment.
+## Install
 
 ```bash
 pip install pydantic
-pip install pymupdf   # recommended for PDFs
+
+# local HF backend only
+pip install torch transformers accelerate
+
+# PDF support
+pip install pymupdf
 # or
 pip install pdfplumber
+
+# for deriving REDCap columns from the data dictionary
+pip install openpyxl
 ```
 
-### Install for local HF mode
+## Main tasks
+
+### 1) Extract from a PDF/TXT report into linked JSON
+
+Local HF:
 
 ```bash
-pip install torch transformers accelerate pydantic
-pip install pymupdf   # recommended
-# or
-pip install pdfplumber
-```
-
----
-
-## Quick start
-
-### Local HF inference
-
-```bash
-python medace.py \
+python main.py \
+  --task extract \
   -i report.pdf \
-  --backend hf \
-  -m oss-20b \
-  --num-gpus 2
+  -m oss-20b
 ```
 
-### vLLM endpoint inference
+External vLLM endpoint:
 
 ```bash
-python medace.py \
+python main.py \
+  --task extract \
   -i report.pdf \
+  -m openai/gpt-oss-120b \
   --backend vllm \
-  --base-url http://127.0.0.1:8020 \
-  -m openai/gpt-oss-120b
+  --base-url http://127.0.0.1:8020
 ```
 
-### Auto backend selection
-
-If `--base-url` is supplied, `--backend auto` selects the endpoint backend automatically.
-
-```bash
-python medace.py \
-  -i report.pdf \
-  --base-url http://127.0.0.1:8020 \
-  -m openai/gpt-oss-20b
-```
-
-### Backward compatibility
-
-`main.py` still works and now simply delegates to `medace.py`:
-
-```bash
-python main.py -i report.pdf --base-url http://127.0.0.1:8020 -m openai/gpt-oss-20b
-```
-
----
-
-## CLI reference
-
-```bash
-python medace.py \
-  -i report.pdf \
-  -o output.json \
-  -m oss-20b \
-  --backend auto \
-  --base-url http://127.0.0.1:8020 \
-  --api-key EMPTY \
-  --read-timeout 1800 \
-  --num-gpus 2 \
-  --dtype bfloat16 \
-  --input-format pdf \
-  --temperature 0.0 \
-  --top-p 1.0 \
-  --max-new-tokens 32768 \
-  --max-retries 3 \
-  --verbose
-```
-
-### Key arguments
-
-- `--backend {auto,hf,vllm}`: choose inference backend
-- `--base-url`: OpenAI-compatible vLLM endpoint base URL
-- `--read-timeout`: useful for long endpoint generations on HPC
-- `--num-gpus`: HF backend only; budgets across visible GPUs
-- `--print-prompt`: prints the schema-derived prompt and exits
-
----
-
-## IU HPC / vLLM workflow
-
-Your sbatch launcher starts the server first, then this CLI should point at that server.
-
-Typical pattern:
-
-1. Start `gpt-oss-20b` or `gpt-oss-120b` with the sbatch/apptainer server job
-2. Wait until the endpoint responds at `/v1/models`
-3. Run:
-
-```bash
-python medace.py \
-  -i /path/to/report.pdf \
-  --backend vllm \
-  --base-url http://127.0.0.1:8020 \
-  -m openai/gpt-oss-120b
-```
-
-The served model name must match what the vLLM server exposes.
-
----
-
-## Output format
-
-The output is a JSON object conforming to `schema.py`.
-
-Example skeleton:
+This writes a linked, single-report JSON by default:
 
 ```json
 {
-  "patient": {
-    "patient_name_last": null,
-    "patient_name_first": null,
-    "date_of_birth": null,
-    "mrn": null,
-    "sex": null,
-    "field_confidence": null
-  },
-  "nicu_flags": {
-    "nicu_genetic_testing": true,
-    "nicu_genetic_diagnosis": false,
-    "field_confidence": {
-      "nicu_genetic_testing": {
-        "confidence": "high",
-        "interval": "0.95-0.99"
-      }
-    }
-  },
-  "test_info": {
-    "test_type": "Genome Sequencing",
-    "test_name": "Rapid Genome Sequencing",
-    "result_available": true,
-    "test_declined": false,
-    "lab": "IU Diagnostic Genomics",
-    "order_date": "2024-08-22",
-    "result_date": "2024-08-29",
-    "timeframe": "NICU Stay",
-    "analysis_type": "Proband Only",
-    "secondary_findings": "Opt-OUT",
-    "findings_reported": true,
-    "field_confidence": {
-      "test_type": {
-        "confidence": "high",
-        "interval": "0.95-0.99"
-      }
-    }
-  },
-  "patient_phenotypes": {
-    "phenotype_test_date": "2024-08-22",
-    "clinical_indication_text": null,
-    "hpo_terms": [],
-    "field_confidence": null
-  },
-  "findings": [],
-  "interpretation": {
-    "result": "Nondiagnostic",
-    "reference_genome": "GRCh38/hg38",
-    "interpretation_summary": null,
-    "field_confidence": null
-  },
-  "diagnoses": [],
-  "extraction_confidence": "high",
-  "extraction_notes": null
+  "patient": { ... },
+  "report_metadata": { ... },
+  "test_info": { ... },
+  "findings_list": [ ... ],
+  "interpretation": { ... },
+  "patient_phenotypes": [ ... ],
+  "diagnoses": [ ... ],
+  "diagnoses_note": "..."
 }
 ```
 
----
+### 2) Extract and also emit REDCap-compatible rows
 
-## Key schema decisions
-
-### Repeatable findings and diagnoses
-
-Instead of creating dozens of hardcoded fields like:
-
-- `genelocus`
-- `genelocus_2`
-- `genelocus_3`
-- ...
-
-the extractor now uses structured lists.
-
-That means:
-
-- easier prompting
-- easier validation
-- easier comparison logic later
-- much less schema churn when the project evolves
-
-### Diagnosis logic
-
-The schema is designed so that:
-
-- VUS-only findings can still appear in `findings`
-- but they do **not** automatically become entries in `diagnoses`
-- carrier status and ROH stay in `findings`, not `diagnoses`
-
-### Phenotype handling
-
-`patient_phenotypes` is kept separate so you can preserve the report-native phenotype text now and decide later whether to crosswalk those terms to HPO/ICD workflows.
-
----
-
-## Debugging
-
-### Print the prompt without running a model
+Genetics-only flat rows:
 
 ```bash
-python medace.py -i report.pdf -m oss-20b --print-prompt
+python main.py \
+  --task extract \
+  -i report.pdf \
+  -m oss-20b \
+  --redcap-output report.redcap.csv
 ```
 
-### If JSON parsing fails repeatedly
+Full current-project column order using the REDCap data dictionary:
 
-The pipeline automatically re-asks with the parse error. If that still fails:
-
-- lower `temperature`
-- reduce `max_new_tokens`
-- inspect the prompt with `--print-prompt`
-- try the endpoint backend with a stronger model
-
-### If validation fails repeatedly
-
-That usually means one of two things:
-
-- the schema is too strict for the report family
-- the field description needs to be more explicit
-
-Edit `schema.py`, not the prompt text.
-
----
-
-## Extending the schema
-
-Everything important lives in `schema.py`.
-
-### Add a new scalar field
-
-```python
-class TestInformation(ConfidenceTrackedModel):
-    accession_number: Optional[str] = Field(
-        None,
-        description="Accession number as printed on the report"
-    )
+```bash
+python main.py \
+  --task extract \
+  -i report.pdf \
+  -m oss-20b \
+  --data-dictionary "14499V2 Annotated Data Dictionary for CTSI Core 3_9_26.xlsx" \
+  --redcap-output report.redcap.csv \
+  --emit-base-row
 ```
 
-### Add a new repeated block
+If no data dictionary is provided, the flat export falls back to a genetics-focused header.
 
-```python
-class AdditionalSample(ConfidenceTrackedModel):
-    sample_type: Optional[str] = Field(None, description="Additional sample type")
+### 3) Import a raw REDCap export into linked patient-case JSON
 
-class GeneticTestExtraction(StrictModel):
-    additional_samples: Optional[List[AdditionalSample]] = Field(
-        None,
-        description="Additional samples linked to the report"
-    )
+```bash
+python main.py \
+  --task import-redcap \
+  -i raw_redcap_export.csv \
+  -o linked_cases.json
 ```
 
-No prompt rewrite is needed.
+The importer groups rows by `mrn_id`, parses the genetics repeating instruments, keeps the original raw column order, and preserves untouched non-genetics repeating instruments for round-tripping.
 
----
+### 4) Export linked JSON back to REDCap-compatible flat rows
 
-## Recommendation for this project
+From linked patient-case JSON:
 
-For IU HPC production runs with `gpt-oss-20b` / `gpt-oss-120b`, prefer:
+```bash
+python main.py \
+  --task export-redcap \
+  -i linked_cases.json \
+  -o roundtrip.csv
+```
 
-- `--backend vllm`
-- `--base-url http://127.0.0.1:<PORT>`
-- `--temperature 0.0`
+Force genetics-only output:
 
-For local debugging on a single machine, HF mode is still available.
+```bash
+python main.py \
+  --task export-redcap \
+  -i linked_cases.json \
+  -o genetics_only.csv \
+  --genetics-only
+```
+
+Use the REDCap data dictionary to rebuild the full current-project header order:
+
+```bash
+python main.py \
+  --task export-redcap \
+  -i linked_cases.json \
+  -o roundtrip.csv \
+  --data-dictionary "14499V2 Annotated Data Dictionary for CTSI Core 3_9_26.xlsx"
+```
+
+### 5) Print / persist the canonical REDCap column order from the data dictionary
+
+```bash
+python main.py \
+  --task print-redcap-columns \
+  --data-dictionary "14499V2 Annotated Data Dictionary for CTSI Core 3_9_26.xlsx" \
+  -o redcap_columns.json
+```
+
+## Schema highlights
+
+The extraction schema now explicitly covers the project’s genetics-facing pieces:
+
+- `patient`
+- `report_metadata`
+- `test_info`
+- `findings_list`
+- `interpretation`
+- `patient_phenotypes`
+- `diagnoses`
+- `diagnoses_note`
+
+The REDCap-linked case model additionally preserves:
+
+- `legacy_base_row`
+- `legacy_other_repeat_rows`
+- `redcap_column_order`
+- unlinked phenotype rows and diagnosis-note rows when the original flat data is too ambiguous to attach safely
+
+## Import/export behavior
+
+### Linking when importing legacy flat REDCap rows
+
+The importer links `patient_phenotypes` and `genetic_diagnoses` rows to `genetic_tests` rows when possible:
+
+- if there is exactly one report, it links everything to that report
+- otherwise it uses conservative date/type/locus heuristics
+- if the match is ambiguous, it leaves the rows in `unlinked_patient_phenotypes` or `unlinked_diagnosis_groups`
+
+That keeps the normalized JSON honest instead of inventing a linkage that REDCap never actually stored.
+
+### Round-tripping legacy rows
+
+When rows are imported from REDCap, the original row dictionaries are preserved on the linked objects. On export, those preserved rows are reused as the starting point whenever possible, so hidden/calculated fields and unrelated repeat instruments are not unnecessarily discarded.
+
+## Prompt / validation loop
+
+The extraction pipeline is still schema-driven:
+
+1. Build prompt instructions from `schema.py`
+2. Run the model
+3. Parse JSON
+4. Validate with Pydantic
+5. Re-ask with validation errors if needed
+
+So `schema.py` remains the single source of truth for the extraction object.
+
+## Important semantics baked into the prompt/schema
+
+- VUS-only, carrier-only, ROH/AOH-only, and negative results should **not** become diagnoses
+- diagnoses should stay linked to the report that supports them
+- phenotype/HPO note blocks should stay linked to the originating report when known
+- a single report may have multiple findings and multiple diagnoses
+
+## Notes on limits
+
+- `genetic_tests` currently supports up to **20** findings per row, matching REDCap
+- `genetic_diagnoses` currently supports up to **3** diagnoses per legacy row; the flat exporter chunks larger diagnosis lists into multiple rows
+- if you export a stand-alone extracted report without the full case context, fields that depend on NICU/base-row context stay blank unless you provide that context yourself
+
+## Backward compatibility
+
+Existing scripts that still call:
+
+```bash
+python medace.py ...
+```
+
+will continue to work, because `medace.py` now simply forwards to `main.py`.
