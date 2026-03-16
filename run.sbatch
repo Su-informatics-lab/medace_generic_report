@@ -2,6 +2,7 @@
 #SBATCH --job-name=medace_quartz_test
 #SBATCH --account=r01668
 #SBATCH --partition=hopper
+#SBATCH --qos=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
