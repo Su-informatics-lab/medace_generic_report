@@ -1,12 +1,13 @@
 # MedACE Pediatric Genetic Report Extraction
 
-Schema-driven extraction for pediatric and NICU genetic testing reports, with REDCap-compatible import and export utilities and a Quartz-ready vLLM workflow.
+Schema-driven extraction for pediatric and NICU genetic testing reports, with REDCap-compatible import/export and a Quartz-oriented vLLM workflow.
 
 ## Repository layout
 
 ```text
 .
 ├── README.md
+├── JOURNEY.md
 ├── main.py
 ├── pull_container.sbatch
 ├── redcap_columns_from_dictionary.json
@@ -14,31 +15,32 @@ Schema-driven extraction for pediatric and NICU genetic testing reports, with RE
 └── schema.py
 ```
 
-## What this repository does
+## Scope
+
+This repository does four things:
 
 - extracts structured genetics data from report text or PDFs
-- keeps report-level linkage among test metadata, findings, HPO terms, and diagnoses
-- supports import from and export back to the current REDCap flat layout
-- runs on IU Quartz with a local vLLM server inside Apptainer
+- preserves report-level linkage among test metadata, findings, HPO terms, and diagnoses
+- imports from and exports back to the current flat REDCap layout
+- runs batch extraction on IU Quartz with a local vLLM server inside Apptainer
 
 ## Core files
 
-- `main.py`: main CLI for extraction and REDCap import/export
-- `schema.py`: single source of truth for the extraction schema and validation
-- `run.sbatch`: one-step Quartz job that activates the environment, starts vLLM, waits for readiness, and runs extraction
-- `pull_container.sbatch`: one-time job to build the Apptainer image from the official `vllm/vllm-openai` container
-- `redcap_columns_from_dictionary.json`: current derived REDCap column order
+- `main.py` — main CLI for extraction and REDCap import/export
+- `schema.py` — single source of truth for the extraction schema and validation
+- `run.sbatch` — main Quartz batch entry point; starts vLLM and runs extraction
+- `pull_container.sbatch` — one-time Slurm job to build the Apptainer image
+- `redcap_columns_from_dictionary.json` — current derived REDCap column order
+- `JOURNEY.md` — working status, blockers, and next steps
 
-## Quartz setup
+## Recommended Quartz setup
 
-### 1) create the Python environment
+### 1) Create the virtual environment
+
+Create the environment once inside the repo.
 
 ```bash
-module purge
-module load python/3.12.4
-module load apptainer/1.3.6
-
-python -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install "pydantic>=2,<3"
@@ -54,9 +56,11 @@ python -m pip install "pymupdf>=1.24" "pdfplumber>=0.11"
 python -m pip install "openpyxl>=3.1"
 ```
 
-### 2) configure the Hugging Face cache
+Batch jobs should use the repo-local `.venv` directly. Do not rely on Quartz Python modules inside `run.sbatch`.
 
-Store the model cache on project storage, not in home.
+### 2) Configure project-level caches
+
+Keep model and container caches on project storage, not in home.
 
 ```bash
 export HF_HOME=/N/project/textattn/hf_cache
@@ -65,31 +69,51 @@ printf '%s' "$HF_TOKEN" > "$HF_HOME/token"
 chmod 600 "$HF_HOME/token"
 ```
 
-`run.sbatch` will read the token from `$HF_HOME/token` automatically.
+Recommended Apptainer cache locations:
 
-### 3) build the Apptainer image once
+```bash
+export APPTAINER_CACHEDIR=/N/project/textattn/apptainer_cache
+export APPTAINER_TMPDIR=/N/project/textattn/apptainer_tmp
+mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+```
+
+`run.sbatch` reads the Hugging Face token from `$HF_HOME/token` automatically.
+
+### 3) Build the Apptainer image once
+
+Do this through Slurm, not on the login node.
 
 ```bash
 sbatch pull_container.sbatch
 ```
 
-Expected output image:
+Expected image:
 
 ```text
 containers/vllm-openai-latest.sif
 ```
 
+A successful sanity check looks like:
+
+```bash
+module purge
+module load apptainer/1.3.6
+apptainer exec --cleanenv containers/vllm-openai-latest.sif /bin/sh -lc 'python3 -c "import vllm; print(vllm.__version__)"'
+```
+
 ## Running extraction on Quartz
 
-`run.sbatch` is the main entry point. It does all of the following in one job:
+`run.sbatch` is the main entry point. It should remain the single production script.
 
-1. loads Quartz modules
-2. activates `.venv`
-3. writes the GPT-OSS Hopper config
-4. starts a local vLLM server inside Apptainer
-5. waits for server readiness
-6. runs `main.py` over the report files
-7. writes JSON, CSV, and status outputs
+It is responsible for:
+
+1. loading Apptainer
+2. using the repo-local `.venv`
+3. writing the GPT-OSS Hopper config
+4. starting a local vLLM server inside Apptainer
+5. waiting for readiness
+6. running `main.py` over the report files
+7. writing JSON, CSV, and status outputs
 
 ### Smoke test
 
@@ -110,15 +134,34 @@ sbatch --export=ALL,LIMIT=5 run.sbatch
 sbatch --export=ALL,LIMIT=0 run.sbatch
 ```
 
-## Important runtime parameters
+## Important Quartz notes
 
-You can override these at submission time with `--export=ALL,...`:
+- On Quartz, `gpu` and `gpu-interactive` are V100 partitions.
+- On Quartz, `hopper` is the H100 partition.
+- `gpt-oss-120b` should run on `hopper`, not on the V100 partitions.
+- At the moment, Hopper access is allocation-dependent. If the current Slurm account does not have Hopper QOS, jobs will fail with `Invalid qos specification`.
+- Check the live partition layout with:
 
-- `INPUT_DIR`: folder containing report `.txt` files
-- `LIMIT`: number of files to process; `0` means all files
-- `MODEL`: defaults to `openai/gpt-oss-120b`
-- `HF_HOME`: Hugging Face cache root
-- `IMG_FILE`: Apptainer image path
+```bash
+sinfo -o "%P %G %N" | egrep 'hopper|gpu|interactive'
+```
+
+- Check account/QOS associations with:
+
+```bash
+sacctmgr -nP show assoc where user=$USER format=cluster,account,user,partition,qos%50,defaultqos%30
+```
+
+## Runtime overrides
+
+Useful overrides at submission time:
+
+- `INPUT_DIR` — folder containing report `.txt` files
+- `LIMIT` — number of files to process; `0` means all files
+- `MODEL` — defaults to `openai/gpt-oss-120b`
+- `HF_HOME` — Hugging Face cache root
+- `IMG_FILE` — Apptainer image path
+- `RUN_DIR` — output directory for the current job
 
 Example:
 
@@ -128,7 +171,7 @@ sbatch --export=ALL,INPUT_DIR=/N/project/_A-Aa-a0-9/note/report,LIMIT=10 run.sba
 
 ## Outputs
 
-### Slurm and server logs
+### Logs
 
 ```text
 logs/medace_quartz_test_<jobid>.log
@@ -151,9 +194,10 @@ outputs/quartz_<jobid>/status.tsv
 
 ## Direct CLI use
 
-For non-Slurm or debugging workflows, inspect the CLI directly:
+For debugging or non-Slurm use:
 
 ```bash
+source .venv/bin/activate
 python main.py --help
 ```
 
@@ -164,8 +208,13 @@ Common tasks include:
 - linked JSON export back to REDCap-compatible rows
 - printing canonical REDCap column order from a data dictionary
 
-## Notes
+## Troubleshooting
 
-- `run.sbatch` is the preferred production path on Quartz.
-- The current batch workflow assumes report text files are available in a directory and processes them sequentially.
-- The schema is designed to preserve report-to-diagnosis linkage when available and to stay backward compatible with the current REDCap layout.
+- If `apptainer pull` is killed on the login node, use `pull_container.sbatch`.
+- If a Hopper job fails with `Invalid qos specification`, the Slurm account does not currently have Hopper permission.
+- If a batch job prints noisy Lmod dependency messages at startup, do not chase them first; confirm whether the repo `.venv` and Apptainer launch are actually failing.
+- If the vLLM server exits before readiness, inspect `logs/vllm_<jobid>.err` first.
+
+## Status tracking
+
+The current project state, blockers, and next actions live in `JOURNEY.md`.
