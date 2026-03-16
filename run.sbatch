@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH --job-name=medace_quartz_test
-#SBATCH --account=r01985
+#SBATCH --account=r01668
 #SBATCH --partition=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
