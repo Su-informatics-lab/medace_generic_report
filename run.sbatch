@@ -79,7 +79,6 @@ export APPTAINERENV_VLLM_NO_USAGE_STATS=1
 # explicit Quartz modules
 # -------------------------------
 module purge || true
-module load python/3.12.4
 module load apptainer/1.3.6
 
 # -------------------------------
