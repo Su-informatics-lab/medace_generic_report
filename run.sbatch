@@ -35,6 +35,8 @@ CSV_OUT="$RUN_DIR/extractions.csv"
 LOG_DIR="$CODE_DIR/logs"
 STATUS_TSV="$RUN_DIR/status.tsv"
 YAML_FILE="$CODE_DIR/GPT-OSS_Hopper.yaml"
+VLLM_LOG="$LOG_DIR/vllm_${SLURM_JOB_ID}.log"
+VLLM_ERR="$LOG_DIR/vllm_${SLURM_JOB_ID}.err"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR" "$JSON_DIR" "$HF_HOME" "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 cd "$CODE_DIR"
@@ -71,41 +73,37 @@ else
   log "warn: model download may fail if the repo requires authentication"
 fi
 
-# ensure clean env inside the container but pass only what we need
+# only pass what the clean container needs
 export APPTAINERENV_HF_HOME=/root/.cache/huggingface
 export APPTAINERENV_VLLM_NO_USAGE_STATS=1
 
 # -------------------------------
-# explicit Quartz modules
+# modules: avoid Quartz Python modules; use the repo venv directly
 # -------------------------------
 module purge || true
 module load apptainer/1.3.6
 
 # -------------------------------
-# activate venv
+# use repo venv python explicitly
 # -------------------------------
-if [[ ! -f "$CODE_DIR/.venv/bin/activate" ]]; then
-  log "fatal: missing virtualenv at $CODE_DIR/.venv"
+PYTHON_BIN="$CODE_DIR/.venv/bin/python"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  log "fatal: missing virtualenv python at $PYTHON_BIN"
   exit 2
 fi
-source "$CODE_DIR/.venv/bin/activate"
 
-command -v python >/dev/null || { log "fatal: python not found after venv activation"; exit 3; }
 command -v apptainer >/dev/null || { log "fatal: apptainer not found after module load"; exit 4; }
 command -v curl >/dev/null || { log "fatal: curl not found"; exit 5; }
 [[ -f "$CODE_DIR/main.py" ]] || { log "fatal: missing $CODE_DIR/main.py"; exit 6; }
 [[ -d "$INPUT_DIR" ]] || { log "fatal: missing input dir $INPUT_DIR"; exit 9; }
+[[ -f "$IMG_FILE" ]] || { log "fatal: Apptainer image not found: $IMG_FILE"; exit 7; }
 
-log "python: $(python --version 2>&1)"
-log "python path: $(which python)"
+log "python: $("$PYTHON_BIN" --version 2>&1)"
+log "python path: $PYTHON_BIN"
 log "apptainer: $(apptainer --version 2>&1)"
+"$PYTHON_BIN" -c "import pydantic, schema; print('python env ok')" >&2
 log "gpu inventory follows"
 nvidia-smi >&2 || true
-
-if [[ ! -f "$IMG_FILE" ]]; then
-  log "fatal: Apptainer image not found: $IMG_FILE"
-  exit 7
-fi
 
 # -------------------------------
 # write the GPT-OSS Hopper config
@@ -136,9 +134,11 @@ apptainer exec --cleanenv --nv \
       --port '$PORT' \
       --download-dir /root/.cache/huggingface \
       --tensor-parallel-size 1
-  " >"$LOG_DIR/vllm_${SLURM_JOB_ID}.log" 2>"$LOG_DIR/vllm_${SLURM_JOB_ID}.err" &
+  " >"$VLLM_LOG" 2>"$VLLM_ERR" &
 SERVER_PID=$!
 log "vLLM pid: $SERVER_PID"
+log "vLLM stdout: $VLLM_LOG"
+log "vLLM stderr: $VLLM_ERR"
 
 cleanup() {
   log "stopping vLLM server"
@@ -155,7 +155,8 @@ for ((i=1; i<=300; i++)); do
   fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     log "fatal: vLLM exited before becoming ready"
-    log "see $LOG_DIR/vllm_${SLURM_JOB_ID}.err"
+    log "last vLLM stderr lines follow"
+    tail -n 80 "$VLLM_ERR" >&2 || true
     exit 8
   fi
   if (( i % 10 == 0 )); then
@@ -163,7 +164,8 @@ for ((i=1; i<=300; i++)); do
   fi
   if (( i == 300 )); then
     log "fatal: vLLM did not become ready in time"
-    log "see $LOG_DIR/vllm_${SLURM_JOB_ID}.log and .err"
+    log "last vLLM stderr lines follow"
+    tail -n 80 "$VLLM_ERR" >&2 || true
     exit 8
   fi
   sleep 2
@@ -205,7 +207,7 @@ for idx in "${!REPORTS[@]}"; do
   client_err="$LOG_DIR/${stem}_${SLURM_JOB_ID}.client.err"
 
   log "[$((idx+1))/${#REPORTS[@]}] extracting $base"
-  if python main.py \
+  if "$PYTHON_BIN" main.py \
       --input "$report" \
       --output "$json_out" \
       --model "$MODEL" \
@@ -220,7 +222,8 @@ for idx in "${!REPORTS[@]}"; do
     log "[$((idx+1))/${#REPORTS[@]}] success: $base"
   else
     printf '%s\t%s\tfail\tsee %s\n' "$report" "$json_out" "$client_err" >> "$STATUS_TSV"
-    log "[$((idx+1))/${#REPORTS[@]}] failed: $base; see $client_err"
+    log "[$((idx+1))/${#REPORTS[@]}] failed: $base; last client stderr lines follow"
+    tail -n 50 "$client_err" >&2 || true
   fi
 done
 
@@ -228,7 +231,7 @@ done
 # aggregate JSON outputs into CSV
 # -------------------------------
 log "aggregating JSON outputs into CSV"
-JSON_DIR="$JSON_DIR" CSV_OUT="$CSV_OUT" python - <<'PY'
+JSON_DIR="$JSON_DIR" CSV_OUT="$CSV_OUT" "$PYTHON_BIN" - <<'PY'
 import csv
 import json
 import os
