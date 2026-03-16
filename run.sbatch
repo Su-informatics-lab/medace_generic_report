@@ -7,43 +7,55 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=h100:1
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.err
 
 set -euo pipefail
 
 # -------------------------------
-# User-tunable settings
+# user-tunable settings
 # -------------------------------
 CODE_DIR="${CODE_DIR:-/N/project/_A-Aa-a0-9/hw56/medace_generic_report}"
 INPUT_DIR="${INPUT_DIR:-/N/project/_A-Aa-a0-9/note/report}"
 MODEL="${MODEL:-openai/gpt-oss-120b}"
-LIMIT="${LIMIT:-5}"               # 0 = all files; default 5 for a quick smoke test
+LIMIT="${LIMIT:-5}"                 # 0 = all files; default 5 for a smoke test
 PORT="${PORT:-8020}"
-GPU_UTIL="${GPU_UTIL:-0.95}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
-MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
-MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-1024}"
 READ_TIMEOUT="${READ_TIMEOUT:-1800}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-12000}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
-IMG_FILE="${IMG_FILE:-/N/project/_A-Aa-a0-9/hw56/medace_generic_report/containers/vllm-openai-deploy.sif}"
+IMG_FILE="${IMG_FILE:-/N/project/_A-Aa-a0-9/hw56/medace_generic_report/containers/vllm-openai-latest.sif}"
 HF_HOME="${HF_HOME:-/N/project/textattn/hf_cache}"
+APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-/N/project/textattn/apptainer_cache}"
+APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-/N/project/textattn/apptainer_tmp}"
 API="http://127.0.0.1:${PORT}"
 RUN_DIR="${RUN_DIR:-$CODE_DIR/outputs/quartz_${SLURM_JOB_ID}}"
 JSON_DIR="$RUN_DIR/json"
 CSV_OUT="$RUN_DIR/extractions.csv"
 LOG_DIR="$CODE_DIR/logs"
 STATUS_TSV="$RUN_DIR/status.tsv"
+YAML_FILE="$CODE_DIR/GPT-OSS_Hopper.yaml"
 
-mkdir -p "$LOG_DIR" "$RUN_DIR" "$JSON_DIR" "$HF_HOME"
+mkdir -p "$LOG_DIR" "$RUN_DIR" "$JSON_DIR" "$HF_HOME" "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 cd "$CODE_DIR"
+
+log() {
+  printf '[%(%F %T)T] %s\n' -1 "$*" >&2
+}
+
+log "job started on host $(hostname)"
+log "code dir: $CODE_DIR"
+log "input dir: $INPUT_DIR"
+log "run dir: $RUN_DIR"
+log "image   : $IMG_FILE"
+log "hf home : $HF_HOME"
 
 export PYTHONUNBUFFERED=1
 export HF_HOME
 export HF_HUB_DISABLE_TELEMETRY=1
 export TOKENIZERS_PARALLELISM=false
+export APPTAINER_CACHEDIR APPTAINER_TMPDIR
+export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 
 # pick up HF token from file if present
 if [[ -z "${HF_TOKEN:-}" && -f "$HF_HOME/token" ]]; then
@@ -51,106 +63,128 @@ if [[ -z "${HF_TOKEN:-}" && -f "$HF_HOME/token" ]]; then
 fi
 if [[ -n "${HF_TOKEN:-}" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  export APPTAINERENV_HF_TOKEN="$HF_TOKEN"
+  export APPTAINERENV_HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  log "HF token loaded from environment/file"
 else
-  echo "[warn] HF token not found in environment or $HF_HOME/token"
-  echo "[warn] model download may fail if the repo requires authentication"
+  log "warn: HF token not found in environment or $HF_HOME/token"
+  log "warn: model download may fail if the repo requires authentication"
 fi
 
+# ensure clean env inside the container but pass only what we need
+export APPTAINERENV_HF_HOME=/root/.cache/huggingface
+export APPTAINERENV_VLLM_NO_USAGE_STATS=1
+
 # -------------------------------
-# Explicit Quartz modules
+# explicit Quartz modules
 # -------------------------------
 module purge || true
 module load python/3.12.4
 module load apptainer/1.3.6
 
 # -------------------------------
-# Activate venv
+# activate venv
 # -------------------------------
 if [[ ! -f "$CODE_DIR/.venv/bin/activate" ]]; then
-  echo "[fatal] missing virtualenv at $CODE_DIR/.venv"
+  log "fatal: missing virtualenv at $CODE_DIR/.venv"
   exit 2
 fi
 source "$CODE_DIR/.venv/bin/activate"
 
-command -v python >/dev/null || { echo "[fatal] python not found after venv activation"; exit 3; }
-command -v apptainer >/dev/null || { echo "[fatal] apptainer not found after module load"; exit 4; }
-command -v curl >/dev/null || { echo "[fatal] curl not found"; exit 5; }
-[[ -f "$CODE_DIR/main.py" ]] || { echo "[fatal] missing $CODE_DIR/main.py"; exit 6; }
+command -v python >/dev/null || { log "fatal: python not found after venv activation"; exit 3; }
+command -v apptainer >/dev/null || { log "fatal: apptainer not found after module load"; exit 4; }
+command -v curl >/dev/null || { log "fatal: curl not found"; exit 5; }
+[[ -f "$CODE_DIR/main.py" ]] || { log "fatal: missing $CODE_DIR/main.py"; exit 6; }
+[[ -d "$INPUT_DIR" ]] || { log "fatal: missing input dir $INPUT_DIR"; exit 9; }
 
-python --version
-which python
-apptainer --version
-nvidia-smi || true
+log "python: $(python --version 2>&1)"
+log "python path: $(which python)"
+log "apptainer: $(apptainer --version 2>&1)"
+log "gpu inventory follows"
+nvidia-smi >&2 || true
 
 if [[ ! -f "$IMG_FILE" ]]; then
-  echo "[fatal] Apptainer image not found: $IMG_FILE"
-  echo "        Build it once on the login node with:"
-  echo "        apptainer pull $IMG_FILE docker://vllm/vllm-openai:deploy"
+  log "fatal: Apptainer image not found: $IMG_FILE"
   exit 7
 fi
 
 # -------------------------------
-# Start vLLM in the background
+# write the GPT-OSS Hopper config
 # -------------------------------
-echo "[info] starting vLLM server"
+cat > "$YAML_FILE" <<'YAML'
+no-enable-prefix-caching: true
+max-cudagraph-capture-size: 2048
+max-num-batched-tokens: 8192
+stream-interval: 20
+YAML
+log "wrote Hopper config to $YAML_FILE"
 
-apptainer_cmd=(
-  apptainer exec --nv
-  --bind "$HF_HOME":/root/.cache/huggingface
-  "$IMG_FILE" bash -lc
-  "set -euo pipefail; \
-   export HF_HOME=/root/.cache/huggingface; \
-   vllm serve '$MODEL' \
-     --served-model-name '$MODEL' \
-     --host 0.0.0.0 \
-     --port '$PORT' \
-     --download-dir /root/.cache/huggingface \
-     --tensor-parallel-size 1 \
-     --gpu-memory-utilization '$GPU_UTIL' \
-     --max-model-len '$MAX_MODEL_LEN' \
-     --max-num-seqs '$MAX_NUM_SEQS' \
-     --max-num-batched-tokens '$MAX_BATCHED_TOKENS' \
-     --enable-prefix-caching \
-     --enforce-eager"
-)
+# -------------------------------
+# start vLLM in the background
+# -------------------------------
+log "starting vLLM server"
 
-"${apptainer_cmd[@]}" >"$LOG_DIR/vllm_${SLURM_JOB_ID}.log" 2>"$LOG_DIR/vllm_${SLURM_JOB_ID}.err" &
+apptainer exec --cleanenv --nv \
+  --bind "$HF_HOME":/root/.cache/huggingface \
+  --bind "$CODE_DIR":/work \
+  "$IMG_FILE" /bin/sh -lc "
+    set -eu
+    cd /work
+    vllm serve '$MODEL' \
+      --config /work/$(basename "$YAML_FILE") \
+      --served-model-name '$MODEL' \
+      --host 0.0.0.0 \
+      --port '$PORT' \
+      --download-dir /root/.cache/huggingface \
+      --tensor-parallel-size 1
+  " >"$LOG_DIR/vllm_${SLURM_JOB_ID}.log" 2>"$LOG_DIR/vllm_${SLURM_JOB_ID}.err" &
 SERVER_PID=$!
+log "vLLM pid: $SERVER_PID"
 
 cleanup() {
-  echo "[info] stopping vLLM server"
+  log "stopping vLLM server"
   kill "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-# Wait for readiness
+# wait for readiness
 for ((i=1; i<=300; i++)); do
   if curl -fsS "$API/v1/models" >/dev/null 2>&1; then
-    echo "[info] vLLM ready at $API"
+    log "vLLM ready at $API"
     break
   fi
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    log "fatal: vLLM exited before becoming ready"
+    log "see $LOG_DIR/vllm_${SLURM_JOB_ID}.err"
+    exit 8
+  fi
+  if (( i % 10 == 0 )); then
+    log "waiting for vLLM readiness... (${i}/300)"
+  fi
   if (( i == 300 )); then
-    echo "[fatal] vLLM did not become ready in time"
+    log "fatal: vLLM did not become ready in time"
+    log "see $LOG_DIR/vllm_${SLURM_JOB_ID}.log and .err"
     exit 8
   fi
   sleep 2
 done
 
-# Warmup
+# warmup
 curl -fsS "$API/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' \
   >/dev/null || true
+log "warmup request sent"
 
 # -------------------------------
-# Build report list
+# build report list
 # -------------------------------
 mapfile -t REPORTS < <(find "$INPUT_DIR" -maxdepth 1 -type f \( -name 'GENETIC_REPORT_*.txt' -o -name '*.txt' \) | sort)
 
 if [[ ${#REPORTS[@]} -eq 0 ]]; then
-  echo "[fatal] no report .txt files found under $INPUT_DIR"
-  exit 9
+  log "fatal: no report .txt files found under $INPUT_DIR"
+  exit 10
 fi
 
 if [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT > 0 )) && (( ${#REPORTS[@]} > LIMIT )); then
@@ -158,19 +192,20 @@ if [[ "$LIMIT" =~ ^[0-9]+$ ]] && (( LIMIT > 0 )) && (( ${#REPORTS[@]} > LIMIT ))
 fi
 
 echo -e "source_file\tjson_path\tstatus\tmessage" > "$STATUS_TSV"
-echo "[info] processing ${#REPORTS[@]} report(s)"
+log "processing ${#REPORTS[@]} report(s)"
 
 # -------------------------------
-# Run extraction sequentially
+# run extraction sequentially
 # -------------------------------
-for report in "${REPORTS[@]}"; do
+for idx in "${!REPORTS[@]}"; do
+  report="${REPORTS[$idx]}"
   base="$(basename "$report")"
   stem="${base%.*}"
   json_out="$JSON_DIR/${stem}.extracted.json"
   client_log="$LOG_DIR/${stem}_${SLURM_JOB_ID}.client.log"
   client_err="$LOG_DIR/${stem}_${SLURM_JOB_ID}.client.err"
 
-  echo "[extract] $base"
+  log "[$((idx+1))/${#REPORTS[@]}] extracting $base"
   if python main.py \
       --input "$report" \
       --output "$json_out" \
@@ -183,15 +218,17 @@ for report in "${REPORTS[@]}"; do
       --max-retries "$MAX_RETRIES" \
       >"$client_log" 2>"$client_err"; then
     printf '%s\t%s\tok\t\n' "$report" "$json_out" >> "$STATUS_TSV"
+    log "[$((idx+1))/${#REPORTS[@]}] success: $base"
   else
     printf '%s\t%s\tfail\tsee %s\n' "$report" "$json_out" "$client_err" >> "$STATUS_TSV"
-    echo "[warn] extraction failed for $base"
+    log "[$((idx+1))/${#REPORTS[@]}] failed: $base; see $client_err"
   fi
 done
 
 # -------------------------------
-# Aggregate JSON outputs into CSV
+# aggregate JSON outputs into CSV
 # -------------------------------
+log "aggregating JSON outputs into CSV"
 JSON_DIR="$JSON_DIR" CSV_OUT="$CSV_OUT" python - <<'PY'
 import csv
 import json
@@ -240,6 +277,6 @@ with csv_out.open("w", newline="", encoding="utf-8") as f:
 print(f"[csv] wrote {csv_out} with {len(rows)} row(s)")
 PY
 
-echo "[done] JSON outputs: $JSON_DIR"
-echo "[done] CSV output : $CSV_OUT"
-echo "[done] status TSV : $STATUS_TSV"
+log "done: JSON outputs at $JSON_DIR"
+log "done: CSV output at $CSV_OUT"
+log "done: status TSV at $STATUS_TSV"
