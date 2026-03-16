@@ -1,237 +1,171 @@
-# Pediatric Genetic Report Extractor + REDCap Compatibility
+# MedACE Pediatric Genetic Report Extraction
 
-Structured extraction for pediatric/NICU genetic testing reports with a schema-driven prompt, Pydantic validation, and optional OpenAI-compatible vLLM endpoint support.
+Schema-driven extraction for pediatric and NICU genetic testing reports, with REDCap-compatible import and export utilities and a Quartz-ready vLLM workflow.
 
-The project now supports **two representations at once**:
+## Repository layout
 
-1. A **linked, normalized report object** that keeps a test report together with its findings, phenotype note(s), diagnosis note, and diagnoses.
-2. A **legacy REDCap-compatible flat layout** that can import from and export back to the current raw repeating-instrument structure.
+```text
+.
+├── README.md
+├── main.py
+├── pull_container.sbatch
+├── redcap_columns_from_dictionary.json
+├── run.sbatch
+└── schema.py
+```
 
-`main.py` is the canonical CLI. `medace.py` is only a tiny backward-compatible shim.
+## What this repository does
 
-## Why this structure
+- extracts structured genetics data from report text or PDFs
+- keeps report-level linkage among test metadata, findings, HPO terms, and diagnoses
+- supports import from and export back to the current REDCap flat layout
+- runs on IU Quartz with a local vLLM server inside Apptainer
 
-The current REDCap export stores these at the same logical level but in separate repeating instruments:
+## Core files
 
-- `genetic_tests` → one row per test, with up to 20 finding slots inside the row
-- `patient_phenotypes` → one row per phenotype/HPO note block
-- `genetic_diagnoses` → one row per diagnosis-note block, with up to 3 diagnoses inside the row
+- `main.py`: main CLI for extraction and REDCap import/export
+- `schema.py`: single source of truth for the extraction schema and validation
+- `run.sbatch`: one-step Quartz job that activates the environment, starts vLLM, waits for readiness, and runs extraction
+- `pull_container.sbatch`: one-time job to build the Apptainer image from the official `vllm/vllm-openai` container
+- `redcap_columns_from_dictionary.json`: current derived REDCap column order
 
-That flat layout is fine for REDCap, but it loses the **report ↔ phenotype ↔ diagnosis-note ↔ diagnosis** association.
+## Quartz setup
 
-The normalized JSON keeps that association. The flat exporter degrades back to the current REDCap structure when needed.
-
-## Supported inference backends
-
-- **Local HuggingFace** loading (`torch` + `transformers`)
-- **External vLLM endpoint** exposing an OpenAI-compatible `/v1/chat/completions` API
-
-Known model aliases:
-
-- `oss-120b` → `openai/gpt-oss-120b`
-- `oss-20b` → `openai/gpt-oss-20b`
-- `llama3.1-8b` → `meta-llama/Llama-3.1-8B-Instruct`
-
-## Install
+### 1) create the Python environment
 
 ```bash
-pip install pydantic
+module purge
+module load python/3.12.4
+module load apptainer/1.3.6
 
-# local HF backend only
-pip install torch transformers accelerate
-
-# PDF support
-pip install pymupdf
-# or
-pip install pdfplumber
-
-# for deriving REDCap columns from the data dictionary
-pip install openpyxl
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install "pydantic>=2,<3"
 ```
 
-## Main tasks
-
-### 1) Extract from a PDF/TXT report into linked JSON
-
-Local HF:
+Optional extras:
 
 ```bash
-python main.py \
-  --task extract \
-  -i report.pdf \
-  -m oss-20b
+# PDF input
+python -m pip install "pymupdf>=1.24" "pdfplumber>=0.11"
+
+# data dictionary parsing
+python -m pip install "openpyxl>=3.1"
 ```
 
-External vLLM endpoint:
+### 2) configure the Hugging Face cache
+
+Store the model cache on project storage, not in home.
 
 ```bash
-python main.py \
-  --task extract \
-  -i report.pdf \
-  -m openai/gpt-oss-120b \
-  --backend vllm \
-  --base-url http://127.0.0.1:8020
+export HF_HOME=/N/project/textattn/hf_cache
+mkdir -p "$HF_HOME"
+printf '%s' "$HF_TOKEN" > "$HF_HOME/token"
+chmod 600 "$HF_HOME/token"
 ```
 
-This writes a linked, single-report JSON by default:
+`run.sbatch` will read the token from `$HF_HOME/token` automatically.
 
-```json
-{
-  "patient": { ... },
-  "report_metadata": { ... },
-  "test_info": { ... },
-  "findings_list": [ ... ],
-  "interpretation": { ... },
-  "patient_phenotypes": [ ... ],
-  "diagnoses": [ ... ],
-  "diagnoses_note": "..."
-}
-```
-
-### 2) Extract and also emit REDCap-compatible rows
-
-Genetics-only flat rows:
+### 3) build the Apptainer image once
 
 ```bash
-python main.py \
-  --task extract \
-  -i report.pdf \
-  -m oss-20b \
-  --redcap-output report.redcap.csv
+sbatch pull_container.sbatch
 ```
 
-Full current-project column order using the REDCap data dictionary:
+Expected output image:
+
+```text
+containers/vllm-openai-latest.sif
+```
+
+## Running extraction on Quartz
+
+`run.sbatch` is the main entry point. It does all of the following in one job:
+
+1. loads Quartz modules
+2. activates `.venv`
+3. writes the GPT-OSS Hopper config
+4. starts a local vLLM server inside Apptainer
+5. waits for server readiness
+6. runs `main.py` over the report files
+7. writes JSON, CSV, and status outputs
+
+### Smoke test
 
 ```bash
-python main.py \
-  --task extract \
-  -i report.pdf \
-  -m oss-20b \
-  --data-dictionary "14499V2 Annotated Data Dictionary for CTSI Core 3_9_26.xlsx" \
-  --redcap-output report.redcap.csv \
-  --emit-base-row
+mkdir -p logs outputs
+sbatch --export=ALL,LIMIT=1 run.sbatch
 ```
 
-If no data dictionary is provided, the flat export falls back to a genetics-focused header.
-
-### 3) Import a raw REDCap export into linked patient-case JSON
+### Small batch
 
 ```bash
-python main.py \
-  --task import-redcap \
-  -i raw_redcap_export.csv \
-  -o linked_cases.json
+sbatch --export=ALL,LIMIT=5 run.sbatch
 ```
 
-The importer groups rows by `mrn_id`, parses the genetics repeating instruments, keeps the original raw column order, and preserves untouched non-genetics repeating instruments for round-tripping.
-
-### 4) Export linked JSON back to REDCap-compatible flat rows
-
-From linked patient-case JSON:
+### All reports
 
 ```bash
-python main.py \
-  --task export-redcap \
-  -i linked_cases.json \
-  -o roundtrip.csv
+sbatch --export=ALL,LIMIT=0 run.sbatch
 ```
 
-Force genetics-only output:
+## Important runtime parameters
+
+You can override these at submission time with `--export=ALL,...`:
+
+- `INPUT_DIR`: folder containing report `.txt` files
+- `LIMIT`: number of files to process; `0` means all files
+- `MODEL`: defaults to `openai/gpt-oss-120b`
+- `HF_HOME`: Hugging Face cache root
+- `IMG_FILE`: Apptainer image path
+
+Example:
 
 ```bash
-python main.py \
-  --task export-redcap \
-  -i linked_cases.json \
-  -o genetics_only.csv \
-  --genetics-only
+sbatch --export=ALL,INPUT_DIR=/N/project/_A-Aa-a0-9/note/report,LIMIT=10 run.sbatch
 ```
 
-Use the REDCap data dictionary to rebuild the full current-project header order:
+## Outputs
+
+### Slurm and server logs
+
+```text
+logs/medace_quartz_test_<jobid>.log
+logs/medace_quartz_test_<jobid>.err
+logs/vllm_<jobid>.log
+logs/vllm_<jobid>.err
+logs/<report>_<jobid>.client.log
+logs/<report>_<jobid>.client.err
+```
+
+The Slurm `.err` file is the main progress log.
+
+### Extraction artifacts
+
+```text
+outputs/quartz_<jobid>/json/*.extracted.json
+outputs/quartz_<jobid>/extractions.csv
+outputs/quartz_<jobid>/status.tsv
+```
+
+## Direct CLI use
+
+For non-Slurm or debugging workflows, inspect the CLI directly:
 
 ```bash
-python main.py \
-  --task export-redcap \
-  -i linked_cases.json \
-  -o roundtrip.csv \
-  --data-dictionary "14499V2 Annotated Data Dictionary for CTSI Core 3_9_26.xlsx"
+python main.py --help
 ```
 
-### 5) Print / persist the canonical REDCap column order from the data dictionary
+Common tasks include:
 
-```bash
-python main.py \
-  --task print-redcap-columns \
-  --data-dictionary "14499V2 Annotated Data Dictionary for CTSI Core 3_9_26.xlsx" \
-  -o redcap_columns.json
-```
+- report extraction
+- REDCap import to linked JSON
+- linked JSON export back to REDCap-compatible rows
+- printing canonical REDCap column order from a data dictionary
 
-## Schema highlights
+## Notes
 
-The extraction schema now explicitly covers the project’s genetics-facing pieces:
-
-- `patient`
-- `report_metadata`
-- `test_info`
-- `findings_list`
-- `interpretation`
-- `patient_phenotypes`
-- `diagnoses`
-- `diagnoses_note`
-
-The REDCap-linked case model additionally preserves:
-
-- `legacy_base_row`
-- `legacy_other_repeat_rows`
-- `redcap_column_order`
-- unlinked phenotype rows and diagnosis-note rows when the original flat data is too ambiguous to attach safely
-
-## Import/export behavior
-
-### Linking when importing legacy flat REDCap rows
-
-The importer links `patient_phenotypes` and `genetic_diagnoses` rows to `genetic_tests` rows when possible:
-
-- if there is exactly one report, it links everything to that report
-- otherwise it uses conservative date/type/locus heuristics
-- if the match is ambiguous, it leaves the rows in `unlinked_patient_phenotypes` or `unlinked_diagnosis_groups`
-
-That keeps the normalized JSON honest instead of inventing a linkage that REDCap never actually stored.
-
-### Round-tripping legacy rows
-
-When rows are imported from REDCap, the original row dictionaries are preserved on the linked objects. On export, those preserved rows are reused as the starting point whenever possible, so hidden/calculated fields and unrelated repeat instruments are not unnecessarily discarded.
-
-## Prompt / validation loop
-
-The extraction pipeline is still schema-driven:
-
-1. Build prompt instructions from `schema.py`
-2. Run the model
-3. Parse JSON
-4. Validate with Pydantic
-5. Re-ask with validation errors if needed
-
-So `schema.py` remains the single source of truth for the extraction object.
-
-## Important semantics baked into the prompt/schema
-
-- VUS-only, carrier-only, ROH/AOH-only, and negative results should **not** become diagnoses
-- diagnoses should stay linked to the report that supports them
-- phenotype/HPO note blocks should stay linked to the originating report when known
-- a single report may have multiple findings and multiple diagnoses
-
-## Notes on limits
-
-- `genetic_tests` currently supports up to **20** findings per row, matching REDCap
-- `genetic_diagnoses` currently supports up to **3** diagnoses per legacy row; the flat exporter chunks larger diagnosis lists into multiple rows
-- if you export a stand-alone extracted report without the full case context, fields that depend on NICU/base-row context stay blank unless you provide that context yourself
-
-## Backward compatibility
-
-Existing scripts that still call:
-
-```bash
-python medace.py ...
-```
-
-will continue to work, because `medace.py` now simply forwards to `main.py`.
+- `run.sbatch` is the preferred production path on Quartz.
+- The current batch workflow assumes report text files are available in a directory and processes them sequentially.
+- The schema is designed to preserve report-to-diagnosis linkage when available and to stay backward compatible with the current REDCap layout.
