@@ -27,8 +27,6 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-12000}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 IMG_FILE="${IMG_FILE:-/N/project/_A-Aa-a0-9/hw56/medace_generic_report/containers/vllm-openai-latest.sif}"
 HF_HOME="${HF_HOME:-/N/project/textattn/hf_cache}"
-APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-/N/project/textattn/apptainer_cache}"
-APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-/N/project/textattn/apptainer_tmp}"
 API="http://127.0.0.1:${PORT}"
 RUN_DIR="${RUN_DIR:-$CODE_DIR/outputs/quartz_${SLURM_JOB_ID}}"
 JSON_DIR="$RUN_DIR/json"
@@ -38,9 +36,14 @@ STATUS_TSV="$RUN_DIR/status.tsv"
 YAML_FILE="$CODE_DIR/GPT-OSS_Hopper.yaml"
 VLLM_LOG="$LOG_DIR/vllm_${SLURM_JOB_ID}.log"
 VLLM_ERR="$LOG_DIR/vllm_${SLURM_JOB_ID}.err"
-VLLM_STARTUP_ATTEMPTS="${VLLM_STARTUP_ATTEMPTS:-300}"  # 300 * 2s = 10 minutes
+VLLM_STARTUP_ATTEMPTS="${VLLM_STARTUP_ATTEMPTS:-900}"  # 900 * 2s = 30 minutes
 
-mkdir -p "$LOG_DIR" "$RUN_DIR" "$JSON_DIR" "$HF_HOME" "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
+# prefer node-local temp/cache for apptainer runtime assembly
+NODE_TMP_ROOT="${SLURM_TMPDIR:-/tmp/${USER}/${SLURM_JOB_ID}}"
+APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-$NODE_TMP_ROOT/apptainer_tmp}"
+APPTAINER_CACHEDIR="${APPTAINER_CACHEDIR:-$NODE_TMP_ROOT/apptainer_cache}"
+
+mkdir -p "$LOG_DIR" "$RUN_DIR" "$JSON_DIR" "$HF_HOME" "$APPTAINER_TMPDIR" "$APPTAINER_CACHEDIR"
 cd "$CODE_DIR"
 
 log() {
@@ -53,16 +56,19 @@ log "input dir: $INPUT_DIR"
 log "run dir: $RUN_DIR"
 log "image   : $IMG_FILE"
 log "hf home : $HF_HOME"
+log "apptainer tmp : $APPTAINER_TMPDIR"
+log "apptainer cache: $APPTAINER_CACHEDIR"
 
 export PYTHONUNBUFFERED=1
 export HF_HOME
 export HF_HUB_DISABLE_TELEMETRY=1
 export TOKENIZERS_PARALLELISM=false
-export APPTAINER_CACHEDIR APPTAINER_TMPDIR
+export APPTAINER_TMPDIR APPTAINER_CACHEDIR
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 
 # keep host bind settings from leaking into apptainer
 unset APPTAINER_BIND APPTAINER_BINDPATH SINGULARITY_BIND SINGULARITY_BINDPATH || true
+unset APPTAINERENV_HOME SINGULARITYENV_HOME || true
 
 # pick up HF token from file if present
 if [[ -z "${HF_TOKEN:-}" && -f "$HF_HOME/token" ]]; then
@@ -76,31 +82,9 @@ else
   log "warn: model download may fail if the repo requires authentication"
 fi
 
-# only pass what the clean container needs
-export APPTAINERENV_HF_HOME=/root/.cache/huggingface
-export APPTAINERENV_HOME=/tmp
-export APPTAINERENV_XDG_CACHE_HOME=/tmp/.cache
-export APPTAINERENV_VLLM_NO_USAGE_STATS=1
-export APPTAINERENV_HF_HUB_DISABLE_TELEMETRY=1
-export APPTAINERENV_TOKENIZERS_PARALLELISM=false
-export APPTAINERENV_PYTHONNOUSERSITE=1
-export APPTAINERENV_PIP_USER=no
-export APPTAINERENV_TORCH_COMPILE_DISABLE=1
-export APPTAINERENV_PYTORCH_JIT=0
-if [[ -n "${HF_TOKEN:-}" ]]; then
-  export APPTAINERENV_HF_TOKEN="$HF_TOKEN"
-  export APPTAINERENV_HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-fi
-
-# -------------------------------
-# modules: avoid Quartz Python modules; use the repo venv directly
-# -------------------------------
 module purge || true
 module load apptainer/1.3.6
 
-# -------------------------------
-# use repo venv python explicitly
-# -------------------------------
 PYTHON_BIN="$CODE_DIR/.venv/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then
   log "fatal: missing virtualenv python at $PYTHON_BIN"
@@ -120,9 +104,6 @@ log "apptainer: $(apptainer --version 2>&1)"
 log "gpu inventory follows"
 nvidia-smi >&2 || true
 
-# -------------------------------
-# write the GPT-OSS Hopper config
-# -------------------------------
 cat > "$YAML_FILE" <<'YAML'
 no-enable-prefix-caching: true
 max-cudagraph-capture-size: 2048
@@ -131,20 +112,42 @@ stream-interval: 20
 YAML
 log "wrote Hopper config to $YAML_FILE"
 
-# -------------------------------
-# start vLLM in the background
-# -------------------------------
+# optional: stage the image to node-local scratch to avoid network-fs quirks
+LOCAL_IMG="$NODE_TMP_ROOT/$(basename "$IMG_FILE")"
+if [[ ! -f "$LOCAL_IMG" || "$IMG_FILE" -nt "$LOCAL_IMG" ]]; then
+  log "copying image to node-local scratch: $LOCAL_IMG"
+  cp -f "$IMG_FILE" "$LOCAL_IMG"
+fi
+IMG_RUN="$LOCAL_IMG"
+log "runtime image: $IMG_RUN"
+
 log "starting vLLM server"
+
+# follow the simpler known-good pattern from prior apptainer vLLM jobs:
+# --cleanenv + --nv, avoid extra contain/no-mount HOME overrides, and give
+# apptainer a writable tmpfs overlay for runtime GPU library setup.
+APPTAINER_ENV_ARGS=(
+  --env "HF_HOME=/root/.cache/huggingface"
+  --env "HF_HUB_DISABLE_TELEMETRY=1"
+  --env "TOKENIZERS_PARALLELISM=false"
+  --env "PYTHONNOUSERSITE=1"
+  --env "PIP_USER=no"
+  --env "TORCH_COMPILE_DISABLE=1"
+  --env "PYTORCH_JIT=0"
+  --env "VLLM_NO_USAGE_STATS=1"
+)
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  APPTAINER_ENV_ARGS+=(--env "HF_TOKEN=$HF_TOKEN" --env "HUGGING_FACE_HUB_TOKEN=$HF_TOKEN")
+fi
 
 apptainer exec \
   --cleanenv \
-  --contain \
-  --no-mount hostfs,bind-paths,home,cwd \
   --nv \
-  --pwd /work \
-  --bind "$HF_HOME":/root/.cache/huggingface:rw \
-  --bind "$CODE_DIR":/work:ro \
-  "$IMG_FILE" bash --noprofile --norc -c "
+  --writable-tmpfs \
+  --bind "$HF_HOME:/root/.cache/huggingface:rw" \
+  --bind "$CODE_DIR:/work:rw" \
+  "${APPTAINER_ENV_ARGS[@]}" \
+  "$IMG_RUN" bash --noprofile --norc -c "
     set -euo pipefail
     cd /work
     vllm serve '$MODEL' \
@@ -167,7 +170,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# wait for readiness
 for ((i=1; i<=VLLM_STARTUP_ATTEMPTS; i++)); do
   if curl -fsS "$API/v1/models" >/dev/null 2>&1; then
     log "vLLM ready at $API"
@@ -179,7 +181,7 @@ for ((i=1; i<=VLLM_STARTUP_ATTEMPTS; i++)); do
     tail -n 120 "$VLLM_ERR" >&2 || true
     exit 8
   fi
-  if (( i % 10 == 0 )); then
+  if (( i % 15 == 0 )); then
     log "waiting for vLLM readiness... (${i}/${VLLM_STARTUP_ATTEMPTS})"
   fi
   if (( i == VLLM_STARTUP_ATTEMPTS )); then
@@ -191,16 +193,12 @@ for ((i=1; i<=VLLM_STARTUP_ATTEMPTS; i++)); do
   sleep 2
 done
 
-# warmup
 curl -fsS "$API/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"ping"}],"max_tokens":1}' \
   >/dev/null || true
 log "warmup request sent"
 
-# -------------------------------
-# build report list
-# -------------------------------
 mapfile -t REPORTS < <(find "$INPUT_DIR" -maxdepth 1 -type f \( -name 'GENETIC_REPORT_*.txt' -o -name '*.txt' \) | sort)
 
 if [[ ${#REPORTS[@]} -eq 0 ]]; then
@@ -215,9 +213,6 @@ fi
 echo -e "source_file\tjson_path\tstatus\tmessage" > "$STATUS_TSV"
 log "processing ${#REPORTS[@]} report(s)"
 
-# -------------------------------
-# run extraction sequentially
-# -------------------------------
 for idx in "${!REPORTS[@]}"; do
   report="${REPORTS[$idx]}"
   base="$(basename "$report")"
@@ -246,9 +241,6 @@ for idx in "${!REPORTS[@]}"; do
   fi
 done
 
-# -------------------------------
-# aggregate JSON outputs into CSV
-# -------------------------------
 log "aggregating JSON outputs into CSV"
 JSON_DIR="$JSON_DIR" CSV_OUT="$CSV_OUT" "$PYTHON_BIN" - <<'PY'
 import csv
@@ -298,6 +290,6 @@ with csv_out.open("w", newline="", encoding="utf-8") as f:
 print(f"[csv] wrote {csv_out} with {len(rows)} row(s)")
 PY
 
-log "done: JSON outputs at $JSON_DIR"
+log "done: JSON outputs in $JSON_DIR"
 log "done: CSV output at $CSV_OUT"
 log "done: status TSV at $STATUS_TSV"
