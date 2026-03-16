@@ -121,6 +121,15 @@ fi
 IMG_RUN="$LOCAL_IMG"
 log "runtime image: $IMG_RUN"
 
+
+log "preflight: apptainer GPU check"
+if ! apptainer exec --cleanenv --nv "$RUNTIME_IMG" /bin/sh -lc 'nvidia-smi >/dev/null'; then
+  log "fatal: apptainer --nv preflight failed on this node"
+  apptainer buildcfg | egrep 'PACKAGE_VERSION|LOCALSTATEDIR|SESSIONDIR|APPTAINER_SUID_INSTALL' >&2 || true
+  exit 20
+fi
+
+
 log "starting vLLM server"
 
 # follow the simpler known-good pattern from prior apptainer vLLM jobs:
