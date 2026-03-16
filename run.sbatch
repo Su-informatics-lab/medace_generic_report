@@ -2,12 +2,12 @@
 #SBATCH --job-name=medace_quartz_test
 #SBATCH --account=r01985
 #SBATCH --partition=hopper
-#SBATCH --gres=gpu:h100:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
+#SBATCH --gres=gpu:h100:1
 #SBATCH --output=logs/%x_%j.log
 #SBATCH --error=logs/%x_%j.err
 
