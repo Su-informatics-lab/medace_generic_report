@@ -1,6 +1,6 @@
-#!/bin/bash -l
+#!/bin/bash
 #SBATCH --job-name=medace_quartz_test
-#SBATCH --account=r01668
+#SBATCH --account=r01985
 #SBATCH --partition=hopper
 #SBATCH --qos=hopper
 #SBATCH --nodes=1
@@ -38,6 +38,7 @@ STATUS_TSV="$RUN_DIR/status.tsv"
 YAML_FILE="$CODE_DIR/GPT-OSS_Hopper.yaml"
 VLLM_LOG="$LOG_DIR/vllm_${SLURM_JOB_ID}.log"
 VLLM_ERR="$LOG_DIR/vllm_${SLURM_JOB_ID}.err"
+VLLM_STARTUP_ATTEMPTS="${VLLM_STARTUP_ATTEMPTS:-300}"  # 300 * 2s = 10 minutes
 
 mkdir -p "$LOG_DIR" "$RUN_DIR" "$JSON_DIR" "$HF_HOME" "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
 cd "$CODE_DIR"
@@ -60,14 +61,15 @@ export TOKENIZERS_PARALLELISM=false
 export APPTAINER_CACHEDIR APPTAINER_TMPDIR
 export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
 
+# keep host bind settings from leaking into apptainer
+unset APPTAINER_BIND APPTAINER_BINDPATH SINGULARITY_BIND SINGULARITY_BINDPATH || true
+
 # pick up HF token from file if present
 if [[ -z "${HF_TOKEN:-}" && -f "$HF_HOME/token" ]]; then
   export HF_TOKEN="$(<"$HF_HOME/token")"
 fi
 if [[ -n "${HF_TOKEN:-}" ]]; then
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
-  export APPTAINERENV_HF_TOKEN="$HF_TOKEN"
-  export APPTAINERENV_HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
   log "HF token loaded from environment/file"
 else
   log "warn: HF token not found in environment or $HF_HOME/token"
@@ -76,7 +78,19 @@ fi
 
 # only pass what the clean container needs
 export APPTAINERENV_HF_HOME=/root/.cache/huggingface
+export APPTAINERENV_HOME=/tmp
+export APPTAINERENV_XDG_CACHE_HOME=/tmp/.cache
 export APPTAINERENV_VLLM_NO_USAGE_STATS=1
+export APPTAINERENV_HF_HUB_DISABLE_TELEMETRY=1
+export APPTAINERENV_TOKENIZERS_PARALLELISM=false
+export APPTAINERENV_PYTHONNOUSERSITE=1
+export APPTAINERENV_PIP_USER=no
+export APPTAINERENV_TORCH_COMPILE_DISABLE=1
+export APPTAINERENV_PYTORCH_JIT=0
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export APPTAINERENV_HF_TOKEN="$HF_TOKEN"
+  export APPTAINERENV_HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+fi
 
 # -------------------------------
 # modules: avoid Quartz Python modules; use the repo venv directly
@@ -122,11 +136,16 @@ log "wrote Hopper config to $YAML_FILE"
 # -------------------------------
 log "starting vLLM server"
 
-apptainer exec --cleanenv --nv \
-  --bind "$HF_HOME":/root/.cache/huggingface \
-  --bind "$CODE_DIR":/work \
-  "$IMG_FILE" /bin/sh -lc "
-    set -eu
+apptainer exec \
+  --cleanenv \
+  --contain \
+  --no-mount hostfs,bind-paths,home,cwd \
+  --nv \
+  --pwd /work \
+  --bind "$HF_HOME":/root/.cache/huggingface:rw \
+  --bind "$CODE_DIR":/work:ro \
+  "$IMG_FILE" bash --noprofile --norc -c "
+    set -euo pipefail
     cd /work
     vllm serve '$MODEL' \
       --config /work/$(basename "$YAML_FILE") \
@@ -149,7 +168,7 @@ cleanup() {
 trap cleanup EXIT
 
 # wait for readiness
-for ((i=1; i<=300; i++)); do
+for ((i=1; i<=VLLM_STARTUP_ATTEMPTS; i++)); do
   if curl -fsS "$API/v1/models" >/dev/null 2>&1; then
     log "vLLM ready at $API"
     break
@@ -157,16 +176,16 @@ for ((i=1; i<=300; i++)); do
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     log "fatal: vLLM exited before becoming ready"
     log "last vLLM stderr lines follow"
-    tail -n 80 "$VLLM_ERR" >&2 || true
+    tail -n 120 "$VLLM_ERR" >&2 || true
     exit 8
   fi
   if (( i % 10 == 0 )); then
-    log "waiting for vLLM readiness... (${i}/300)"
+    log "waiting for vLLM readiness... (${i}/${VLLM_STARTUP_ATTEMPTS})"
   fi
-  if (( i == 300 )); then
+  if (( i == VLLM_STARTUP_ATTEMPTS )); then
     log "fatal: vLLM did not become ready in time"
     log "last vLLM stderr lines follow"
-    tail -n 80 "$VLLM_ERR" >&2 || true
+    tail -n 120 "$VLLM_ERR" >&2 || true
     exit 8
   fi
   sleep 2
@@ -223,8 +242,7 @@ for idx in "${!REPORTS[@]}"; do
     log "[$((idx+1))/${#REPORTS[@]}] success: $base"
   else
     printf '%s\t%s\tfail\tsee %s\n' "$report" "$json_out" "$client_err" >> "$STATUS_TSV"
-    log "[$((idx+1))/${#REPORTS[@]}] failed: $base; last client stderr lines follow"
-    tail -n 50 "$client_err" >&2 || true
+    log "[$((idx+1))/${#REPORTS[@]}] failed: $base; see $client_err"
   fi
 done
 
