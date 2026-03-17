@@ -218,3 +218,6 @@ Common tasks include:
 ## Status tracking
 
 The current project state, blockers, and next actions live in `JOURNEY.md`.
+
+## License
+MIT
