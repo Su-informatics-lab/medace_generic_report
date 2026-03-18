@@ -6,8 +6,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:h100:1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=256G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
@@ -20,13 +20,13 @@ OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/json}"
 FAIL_DIR="${FAIL_DIR:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/failed}"
 STATUS_TSV="${STATUS_TSV:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/status.tsv}"
 AGGREGATE_CSV="${AGGREGATE_CSV:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/extractions.csv}"
-PATTERN="${PATTERN:-*.pdf}"
+PATTERN="${PATTERN:-*.txt}"
 LIMIT="${LIMIT:-0}"
 
 MODEL="${MODEL:-oss-120b}"
-NUM_GPUS="${NUM_GPUS:-4}"
+NUM_GPUS="${NUM_GPUS:-1}"
 DTYPE="${DTYPE:-auto}"
-INPUT_FORMAT="${INPUT_FORMAT:-auto}"
+INPUT_FORMAT="${INPUT_FORMAT:-text}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-1.0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-12000}"

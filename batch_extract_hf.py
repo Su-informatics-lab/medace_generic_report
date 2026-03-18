@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Batch extraction driver for pediatric genetic reports using the Hugging Face backend.
-
-This keeps orchestration in Python rather than embedding a Python heredoc in sbatch.
-"""
+"""Batch extraction driver for pediatric genetic reports using the Hugging Face backend."""
 
 from __future__ import annotations
 
@@ -27,10 +24,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fail-dir", type=Path, required=True)
     parser.add_argument("--status-tsv", type=Path, required=True)
     parser.add_argument("--aggregate-csv", type=Path, default=None)
-    parser.add_argument("--pattern", default="*.pdf")
+    parser.add_argument("--pattern", default="*.txt")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--model", default="oss-120b")
-    parser.add_argument("--num-gpus", type=int, default=4)
+    parser.add_argument("--num-gpus", type=int, default=1)
     parser.add_argument(
         "--dtype",
         choices=["auto", "bfloat16", "float16", "float32"],
@@ -39,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-format",
         choices=["auto", "text", "pdf"],
-        default="auto",
+        default="text",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -75,14 +72,15 @@ def discover_files(input_path: Path, pattern: str, limit: int) -> list[Path]:
     return files
 
 
-def infer_input_format(path: Path, requested: str) -> str | None:
+def infer_input_format(requested: str) -> str | None:
     if requested == "auto":
         return None
     return requested
 
 
 def ensure_report_file_name(
-    result: GeneticReportExtraction, source_path: Path
+    result: GeneticReportExtraction,
+    source_path: Path,
 ) -> GeneticReportExtraction:
     if result.test_info.file:
         return result
@@ -153,9 +151,7 @@ def main() -> None:
 
             print(f"[run] {index}/{len(files)} {path.name}", flush=True)
             try:
-                report_text = load_report(
-                    path, infer_input_format(path, args.input_format)
-                )
+                report_text = load_report(path, infer_input_format(args.input_format))
                 result = extract(
                     report_text,
                     backend,
@@ -172,7 +168,9 @@ def main() -> None:
                 result = ensure_report_file_name(result, path)
                 out_path.write_text(
                     json.dumps(
-                        result.model_dump(mode="json"), indent=2, ensure_ascii=False
+                        result.model_dump(mode="json"),
+                        indent=2,
+                        ensure_ascii=False,
                     ),
                     encoding="utf-8",
                 )
@@ -182,7 +180,7 @@ def main() -> None:
                 written_jsons.append(out_path)
                 ok += 1
                 print(f"[ok] {path.name} -> {out_path.name}", flush=True)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 failed += 1
                 err_path.write_text(
                     f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}",
