@@ -15,7 +15,7 @@
 set -euo pipefail
 
 REPO_DIR="${REPO_DIR:-$SLURM_SUBMIT_DIR}"
-INPUT_PATH="${INPUT_PATH:-$REPO_DIR/reports}"
+INPUT_PATH="${INPUT_PATH:-/N/project/_A-Aa-a0-9/note/report}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/json}"
 FAIL_DIR="${FAIL_DIR:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/failed}"
 STATUS_TSV="${STATUS_TSV:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/status.tsv}"
