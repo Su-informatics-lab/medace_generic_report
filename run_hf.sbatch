@@ -5,7 +5,7 @@
 #SBATCH --qos=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:h100:1
+#SBATCH --gres=gpu:h100:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=08:00:00
@@ -24,7 +24,7 @@ PATTERN="${PATTERN:-*.txt}"
 LIMIT="${LIMIT:-0}"
 
 MODEL="${MODEL:-oss-20b}"
-NUM_GPUS="${NUM_GPUS:-1}"
+NUM_GPUS="${NUM_GPUS:-2}"
 DTYPE="${DTYPE:-auto}"
 INPUT_FORMAT="${INPUT_FORMAT:-text}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
