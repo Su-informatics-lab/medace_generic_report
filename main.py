@@ -627,7 +627,7 @@ class HFBackend(ChatBackend):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
         model_kwargs = {
-            "torch_dtype": torch_dtype,
+            "dtype": torch_dtype,
             "device_map": "auto",
             "trust_remote_code": True,
         }
