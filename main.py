@@ -19,11 +19,9 @@ import importlib
 import json
 import logging
 import os
-import sys
 import urllib.error
 import urllib.request
 from collections import OrderedDict, defaultdict
-from copy import deepcopy
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence, Type
