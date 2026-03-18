@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH --job-name=medace_hf_oss120b
+#SBATCH --job-name=medace_hf_oss20b
 #SBATCH --account=r01985
 #SBATCH --partition=hopper
 #SBATCH --qos=hopper
