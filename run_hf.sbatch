@@ -5,7 +5,7 @@
 #SBATCH --qos=hopper
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:h100:2
+#SBATCH --gres=gpu:h100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --time=08:00:00
@@ -23,8 +23,8 @@ AGGREGATE_CSV="${AGGREGATE_CSV:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/extract
 PATTERN="${PATTERN:-*.txt}"
 LIMIT="${LIMIT:-0}"
 
-MODEL="${MODEL:-oss-120b}"
-NUM_GPUS="${NUM_GPUS:-2}"
+MODEL="${MODEL:-oss-20b}"
+NUM_GPUS="${NUM_GPUS:-1}"
 DTYPE="${DTYPE:-auto}"
 INPUT_FORMAT="${INPUT_FORMAT:-text}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
