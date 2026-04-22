@@ -690,22 +690,6 @@ class GeneticDiagnosis(BaseModel):
             ):
                 self.dxname = None
         return self
-    @model_validator(mode="after")
-        def reject_misplaced_dxname(self) -> "GeneticDiagnosis":
-            if self.dxname is not None:
-                lower = self.dxname.strip().lower()
-                # reject timeframe labels
-                if lower in {
-                    "nicu stay", "pre-nicu stay", "post-nicu discharge",
-                    "prenatal", "postmortem", "other/unknown", "unknown",
-                }:
-                    self.dxname = None
-                # reject accession-number-like strings (CY21-xxx, SP21-xxx)
-                elif len(lower) < 14 and any(
-                    lower.startswith(p) for p in ("cy1", "cy2", "sp1", "sp2")
-                ):
-                    self.dxname = None
-            return self
 
 class GeneticReportExtraction(BaseModel):
     """Linked, single-report extraction model used by the LLM pipeline.
