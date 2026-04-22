@@ -8,13 +8,13 @@
 #SBATCH --gres=gpu:h100:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
 
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$SLURM_SUBMIT_DIR}"
+REPO_DIR="${REPO_DIR:-/N/project/_A-Aa-a0-9/hw56/medace_generic_report}"
 INPUT_PATH="${INPUT_PATH:-/N/project/_A-Aa-a0-9/note/report}"
 OUTPUT_DIR="${OUTPUT_DIR:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/json}"
 FAIL_DIR="${FAIL_DIR:-$REPO_DIR/outputs/quartz_${SLURM_JOB_ID}/failed}"
