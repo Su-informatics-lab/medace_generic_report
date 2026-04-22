@@ -312,7 +312,12 @@ class PatientDemographics(BaseModel):
 
     mrn_id: Optional[str] = Field(None, description="Medical record number (MRN)")
     study_id: Optional[str] = Field(
-        None, description="Study ID when present in the source context"
+        None,
+        description=(
+            "REDCap study ID when explicitly present (a short alphanumeric "
+            "identifier, NOT a lab name, institution name, or accession number). "
+            "Use null if no study ID is visible in the report."
+        ),
     )
     name: Optional[str] = Field(
         None,
@@ -513,7 +518,14 @@ class GeneticFinding(BaseModel):
     )
     dna: Optional[str] = Field(
         None,
-        description="DNA-level HGVS string or genomic/cytogenetic coordinate/nomenclature",
+        description=(
+            "DNA-level change for this finding. "
+            "For sequence variants: use HGVS notation (e.g., c.1234A>G). "
+            "For microarray/CMA findings: use only the genomic coordinates "
+            "from the arr notation, e.g., '(130,817,325-131,252,373)'. "
+            "Do NOT include the full arr[hg19] string here — put the "
+            "cytogenetic band in genelocus and the copy state in dose."
+        ),
     )
     protein: Optional[str] = Field(
         None, description="Protein-level HGVS notation when stated"
@@ -580,7 +592,14 @@ class PatientPhenotypeNote(BaseModel):
     )
     hpo_terms: Optional[str] = Field(
         None,
-        description="Free-text phenotype or HPO terms block exactly as written or clearly summarized from the report",
+        description=(
+            "Free-text phenotype or HPO terms for THIS SPECIFIC PATIENT "
+            "as written in the clinical indication, reason for referral, or "
+            "patient-specific clinical features section. "
+            "Do NOT include general syndrome descriptions or textbook features "
+            "of a diagnosis from the interpretation/results section — those "
+            "describe the disorder, not the patient's observed phenotype."
+        ),
     )
     parsed_terms: Optional[List[str]] = Field(
         None,
@@ -604,7 +623,16 @@ class GeneticDiagnosis(BaseModel):
 
     dxname: Optional[str] = Field(
         None,
-        description="Name of the confirmed diagnosis/disorder. Do not use a carrier state, ROH alone, or isolated VUS as a diagnosis.",
+        description=(
+            "Name of the confirmed clinical diagnosis or disorder "
+            "(e.g., 'Down syndrome', '22q11.2 Deletion Syndrome'). "
+            "Must be a recognized disease or syndrome name. "
+            "Do NOT put accession numbers, test names, specimen IDs, "
+            "timeframe labels (e.g. 'NICU Stay'), gene loci, karyotype "
+            "strings, or lab classifications here. "
+            "Do not use a carrier state, ROH alone, or isolated VUS. "
+            "Use null if no confirmed diagnosis is stated."
+        ),
     )
     dx_test: Optional[TestType] = Field(
         None, description="Diagnostic test type responsible for this diagnosis"
@@ -620,20 +648,13 @@ class GeneticDiagnosis(BaseModel):
         None,
         description=f"Date of diagnosis/diagnostic report return. {DATE_FORMAT_HINT}",
     )
-    eradx: Optional[DiagnosisStudyPeriod] = Field(
-        None,
-        description="Study period of diagnosis relative to the NICU stay",
-    )
     dxfhx: Optional[bool] = Field(
         None,
-        description="Whether relevant family history was known at the time of testing",
-    )
-    dxage: Optional[int] = Field(
-        None, description="Age in days at diagnosis when available from source context"
-    )
-    dxtimeto: Optional[int] = Field(
-        None,
-        description="Days from NICU admission to diagnosis when available from source context",
+        description=(
+            "Boolean: true if relevant family history was known at the time "
+            "of testing, false if explicitly no family history, null if not "
+            "stated. Must be true, false, or null — never a date, number, or text."
+        ),
     )
     dxomim: Optional[str] = Field(
         None, description="OMIM identifier or mapped phenotype MIM number"
@@ -652,6 +673,39 @@ class GeneticDiagnosis(BaseModel):
     def validate_dx_date(cls, value: Optional[str]) -> Optional[str]:
         return normalize_date(value)
 
+    @model_validator(mode="after")
+    def reject_misplaced_dxname(self) -> "GeneticDiagnosis":
+        """Catch common LLM field-confusion patterns in diagnosis extraction."""
+        if self.dxname is not None:
+            lower = self.dxname.strip().lower()
+            # Reject timeframe labels mistakenly placed in dxname
+            if lower in {
+                "nicu stay", "pre-nicu stay", "post-nicu discharge",
+                "prenatal", "postmortem", "other/unknown", "unknown",
+            }:
+                self.dxname = None
+            # Reject accession-number-like strings (CY21-xxx, SP21-xxx)
+            elif len(lower) < 14 and any(
+                lower.startswith(p) for p in ("cy1", "cy2", "sp1", "sp2")
+            ):
+                self.dxname = None
+        return self
+    @model_validator(mode="after")
+        def reject_misplaced_dxname(self) -> "GeneticDiagnosis":
+            if self.dxname is not None:
+                lower = self.dxname.strip().lower()
+                # reject timeframe labels
+                if lower in {
+                    "nicu stay", "pre-nicu stay", "post-nicu discharge",
+                    "prenatal", "postmortem", "other/unknown", "unknown",
+                }:
+                    self.dxname = None
+                # reject accession-number-like strings (CY21-xxx, SP21-xxx)
+                elif len(lower) < 14 and any(
+                    lower.startswith(p) for p in ("cy1", "cy2", "sp1", "sp2")
+                ):
+                    self.dxname = None
+            return self
 
 class GeneticReportExtraction(BaseModel):
     """Linked, single-report extraction model used by the LLM pipeline.
@@ -877,6 +931,8 @@ def unwrap_optional(annotation: Any) -> tuple[Any, bool]:
 
 
 def describe_field(name: str, info, indent: int = 0) -> List[str]:
+    if getattr(info, "exclude", False):
+        return []
     prefix = "  " * indent
     lines: List[str] = []
     description = info.description or ""

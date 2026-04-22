@@ -585,6 +585,8 @@ GLOBAL RULES:
 - For exome/genome-style reports, capture the phenotype/HPO block in patient_phenotypes when it is present.
 - Use test_info.testcomments for free-text shorthand result notes such as karyotype nomenclature when useful.
 - Output valid JSON only. No markdown fences. No commentary.
+- For diagnosis fields eradx, dxage, dxtimeto: always use null. These are computed post-extraction from NICU admission context.
+- For patient_phenotypes: only extract phenotype terms that describe THIS patient's observed clinical features (from referral indication, clinical history, or HPO section). Do not extract general syndrome feature lists from the lab interpretation.
 """
 
 USER_PROMPT = "GENETIC TEST REPORT:\n\n{report_text}"
@@ -1754,6 +1756,53 @@ def apply_phenotype_to_row(
     set_if_present(row, "hpo_date", iso_to_mdy(hpo_date))
     set_if_present(row, "hpo_terms", note.hpo_terms)
     set_if_present(row, "patient_phenotypes_complete", "2")
+
+
+def _parse_date_safe(value: Optional[str]):
+    """Parse ISO date string to date object, returning None on failure."""
+    if not value:
+        return None
+    try:
+        from datetime import date as _date
+        return _date.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def enrich_diagnosis_from_case_context(
+    diagnosis: GeneticDiagnosis,
+    dob: Optional[str] = None,
+    admit_date: Optional[str] = None,
+    discharge_date: Optional[str] = None,
+) -> GeneticDiagnosis:
+    """Fill eradx/dxage/dxtimeto deterministically from case-level dates."""
+    updates: dict[str, Any] = {}
+    dx = _parse_date_safe(diagnosis.dxdate)
+
+    if dx and dob:
+        birth = _parse_date_safe(dob)
+        if birth:
+            updates["dxage"] = (dx - birth).days
+
+    if dx and admit_date:
+        admit = _parse_date_safe(admit_date)
+        if admit:
+            updates["dxtimeto"] = (dx - admit).days
+            dc = _parse_date_safe(discharge_date) if discharge_date else None
+            if dx < admit:
+                updates["eradx"] = DiagnosisStudyPeriod.pre_nicu_stay
+            elif dc is None or dx <= dc:
+                updates["eradx"] = DiagnosisStudyPeriod.nicu_stay
+            elif (dx - dc).days <= 365:
+                updates["eradx"] = DiagnosisStudyPeriod.year1_post_nicu
+            elif (dx - dc).days <= 730:
+                updates["eradx"] = DiagnosisStudyPeriod.year2_post_nicu
+            else:
+                updates["eradx"] = DiagnosisStudyPeriod.other
+
+    if not updates:
+        return diagnosis
+    return diagnosis.model_copy(update=updates)
 
 
 def diagnosis_with_report_defaults(
